@@ -3,6 +3,9 @@
 ebpf/target/
 **/*.rs.bk
 
+# Packaging output
+/dist/
+
 # IDE / Editor files
 .vscode/
 .idea/

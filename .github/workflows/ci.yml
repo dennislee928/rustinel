@@ -183,6 +183,39 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --locked --verbose
 
+  installer:
+    name: Windows Installer
+    runs-on: windows-latest
+    # Packaging that is only exercised at release time is packaging that breaks
+    # at release time. This builds the MSI on every change, unsigned, so a
+    # broken WiX authoring fails here rather than after a tag is pushed.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+
+      - run: cargo build --locked --release
+
+      - name: Build installer
+        shell: pwsh
+        run: ./scripts/windows/build-msi.ps1
+
+      - name: Verify installer contents
+        shell: pwsh
+        run: ./scripts/windows/verify-msi.ps1 -Path (Get-Item dist/*.msi).FullName
+
   test-macos:
     name: Tests (macOS)
     runs-on: macos-latest
