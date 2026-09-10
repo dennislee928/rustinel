@@ -2,8 +2,19 @@
 //!
 //! Non-blocking alert intake with a background worker that can terminate
 //! processes on critical alerts.
+//!
+//! The engine decides *whether* to act; an
+//! [`ActionExecutor`](executor::ActionExecutor) decides *how*. Everything
+//! Rustinel can do today runs in user mode and therefore acts after the
+//! operation it is responding to has already completed. See [`executor`] for
+//! what a kernel driver would change.
+
+pub mod action;
+pub mod executor;
 
 use crate::config::ResponseConfig;
+use crate::response::action::ResponseAction;
+use crate::response::executor::ActionExecutor;
 use crate::models::{Alert, AlertSeverity, DetectionEngine, EventFields};
 use crate::utils::{
     hash_command_line, normalize_path_for_comparison, validate_process_identity, ProcessIdentity,
@@ -32,6 +43,7 @@ pub struct ResponseEngine {
     config: Arc<ArcSwap<ResponseConfig>>,
     self_pid: u32,
     tx: mpsc::Sender<ResponseTask>,
+    executor: Arc<dyn ActionExecutor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,10 +76,23 @@ pub enum ResponseDecision {
 
 impl ResponseEngine {
     pub fn new(cfg: Arc<ArcSwap<ResponseConfig>>) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::with_executor(cfg, executor::default_executor())
+    }
+
+    /// Build an engine that acts through a specific executor.
+    ///
+    /// Production uses [`executor::default_executor`]; tests substitute
+    /// [`executor::MockExecutor`] to assert on what would have been done
+    /// without touching a real process.
+    pub fn with_executor(
+        cfg: Arc<ArcSwap<ResponseConfig>>,
+        executor: Arc<dyn ActionExecutor>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let channel_capacity = cfg.load().channel_capacity;
         let (tx, mut rx) = mpsc::channel(channel_capacity);
         let self_pid = std::process::id();
         let worker_cfg = cfg.clone();
+        let worker_executor = executor.clone();
 
         let handle = tokio::spawn(async move {
             let initial = worker_cfg.load();
@@ -76,6 +101,7 @@ impl ResponseEngine {
                 enabled = initial.enabled,
                 prevention_enabled = initial.prevention_enabled,
                 min_severity = %initial.min_severity,
+                executor = worker_executor.name(),
                 "Active response worker started"
             );
 
@@ -95,6 +121,7 @@ impl ResponseEngine {
                     self_pid,
                     &prepared.allowlist_images,
                     &prepared.allowlist_paths,
+                    worker_executor.as_ref(),
                 );
             }
 
@@ -106,9 +133,15 @@ impl ResponseEngine {
                 config: cfg,
                 self_pid,
                 tx,
+                executor,
             },
             handle,
         )
+    }
+
+    /// Executor this engine acts through.
+    pub fn executor(&self) -> &Arc<dyn ActionExecutor> {
+        &self.executor
     }
 
     pub fn handle_alert(&self, alert: &Alert) {
@@ -256,6 +289,7 @@ fn handle_task(
     self_pid: u32,
     allowlist_images: &[String],
     allowlist_paths: &[String],
+    executor: &dyn ActionExecutor,
 ) {
     match decide_response(
         task.pid,
@@ -326,8 +360,13 @@ fn handle_task(
             });
 
             match validate_process_identity(&expected_identity) {
-                Ok(current_identity) => match terminate_process(pid) {
-                    Ok(()) => {
+                // Act on the revalidated identity, never on the one the alert
+                // carried: between the alert and here the PID may have been
+                // recycled, and the check above is what proves it was not.
+                Ok(current_identity) => match executor.execute(&ResponseAction::TerminateProcess {
+                    target: current_identity.clone(),
+                }) {
+                    Ok(receipt) => {
                         info!(
                             target: TARGET_RESPONSE,
                             pid,
@@ -336,6 +375,8 @@ fn handle_task(
                             rule = %task.rule_name,
                             engine = ?task.engine,
                             severity = ?task.severity,
+                            executor = receipt.executor,
+                            enforcement = %receipt.enforcement,
                             "Active response terminated process"
                         );
                     }
@@ -347,6 +388,7 @@ fn handle_task(
                             rule = %task.rule_name,
                             engine = ?task.engine,
                             severity = ?task.severity,
+                            executor = executor.name(),
                             error = %err,
                             "Active response failed to terminate process"
                         );
@@ -579,41 +621,6 @@ fn is_allowlisted(image: &str, allowlist_images: &[String], allowlist_paths: &[S
     }
 
     false
-}
-
-#[cfg(windows)]
-fn terminate_process(pid: u32) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
-        .map_err(|err| format!("OpenProcess failed: {}", err))?;
-
-    let result = unsafe { TerminateProcess(handle, 1) };
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(err) => Err(format!("TerminateProcess failed: {}", err)),
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn terminate_process(pid: u32) -> Result<(), String> {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        let err = std::io::Error::last_os_error();
-        Err(format!("kill({}, SIGKILL) failed: {}", pid, err))
-    }
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn terminate_process(_pid: u32) -> Result<(), String> {
-    Err("Active response termination is not supported on this platform".to_string())
 }
 
 #[cfg(test)]
