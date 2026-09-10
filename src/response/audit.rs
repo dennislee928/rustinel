@@ -29,7 +29,10 @@ pub enum ActionOutcome {
     /// Selected, and refused by the safety layer.
     Suppressed { reason: SuppressionReason },
     /// Attempted, and the operating system refused.
-    Failed { executor: &'static str, error: String },
+    Failed {
+        executor: &'static str,
+        error: String,
+    },
 }
 
 impl ActionOutcome {

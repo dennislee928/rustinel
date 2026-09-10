@@ -786,10 +786,7 @@ fn cross_process_alerts_resolve_the_generic_field_names_to_the_source() {
             user: None,
         }),
     );
-    assert_eq!(
-        access.event.get_field("Image"),
-        Some(r"C:\tmp\dumper.exe")
-    );
+    assert_eq!(access.event.get_field("Image"), Some(r"C:\tmp\dumper.exe"));
     assert_eq!(access.event.get_field("ProcessId"), Some("4242"));
     assert_eq!(access.event.get_field("GrantedAccess"), Some("0x1010"));
 }

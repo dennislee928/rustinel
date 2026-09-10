@@ -111,10 +111,7 @@ pub enum ResponseAction {
     /// Quarantine one file.
     QuarantineFile { path: PathBuf },
     /// Delete or restore one registry value.
-    RevertRegistry {
-        key: String,
-        value: Option<String>,
-    },
+    RevertRegistry { key: String, value: Option<String> },
     /// Stop and disable one service.
     DisableService { name: String },
     /// Disable one scheduled task.

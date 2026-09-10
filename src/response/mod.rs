@@ -129,9 +129,8 @@ impl ResponseDecision {
     /// Actions this decision selected, if any.
     fn actions(&self) -> &[ActionKind] {
         match self {
-            ResponseDecision::DryRun { actions, .. } | ResponseDecision::Execute { actions, .. } => {
-                actions
-            }
+            ResponseDecision::DryRun { actions, .. }
+            | ResponseDecision::Execute { actions, .. } => actions,
             _ => &[],
         }
     }
@@ -242,9 +241,7 @@ impl ResponseEngine {
 
         let (pid, image) = extract_process_info(alert);
         let policy = self.current_policy();
-        let rule_dry_run = policy
-            .match_alert(alert)
-            .is_some_and(|rule| rule.dry_run);
+        let rule_dry_run = policy.match_alert(alert).is_some_and(|rule| rule.dry_run);
 
         let task = ResponseTask {
             severity: effective_alert_severity(alert),
@@ -609,12 +606,7 @@ fn log_skipped_target(task: &ResponseTask, decision: &ResponseDecision) {
 }
 
 /// Log what became of one action.
-fn log_outcome(
-    task: &ResponseTask,
-    target: &Target,
-    kind: ActionKind,
-    outcome: &ActionOutcome,
-) {
+fn log_outcome(task: &ResponseTask, target: &Target, kind: ActionKind, outcome: &ActionOutcome) {
     match outcome {
         ActionOutcome::Performed {
             executor,

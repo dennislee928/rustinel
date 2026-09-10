@@ -286,10 +286,7 @@ pub fn is_protected_image(image: &str, configured: &[String]) -> bool {
     let normalized = crate::utils::normalize_path_for_comparison(image);
     let basename = super::image_basename(&normalized);
 
-    if builtin_protected_images()
-        .iter()
-        .any(|protected| basename == *protected)
-    {
+    if builtin_protected_images().contains(&basename) {
         return true;
     }
 
@@ -323,10 +320,11 @@ mod platform {
     pub(super) fn is_critical_process(pid: u32) -> bool {
         with_query_handle(pid, |handle| {
             let mut critical = windows::core::BOOL(0);
-            unsafe { IsProcessCritical(handle, &mut critical) }
-                .is_ok()
-                .then(|| critical.as_bool())
-                .unwrap_or(false)
+            if unsafe { IsProcessCritical(handle, &mut critical) }.is_ok() {
+                critical.as_bool()
+            } else {
+                false
+            }
         })
         .unwrap_or(false)
     }
@@ -355,7 +353,10 @@ mod platform {
     }
 
     /// Run `probe` against a limited-information handle to `pid`.
-    fn with_query_handle<T>(pid: u32, probe: impl FnOnce(windows::Win32::Foundation::HANDLE) -> T) -> Option<T> {
+    fn with_query_handle<T>(
+        pid: u32,
+        probe: impl FnOnce(windows::Win32::Foundation::HANDLE) -> T,
+    ) -> Option<T> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
         let result = probe(handle);
         unsafe {
@@ -490,14 +491,29 @@ mod tests {
         gate.commit(&action(1), start);
 
         assert_eq!(
-            gate.check(&action(1), &policy, &executor, start + Duration::from_secs(10)),
+            gate.check(
+                &action(1),
+                &policy,
+                &executor,
+                start + Duration::from_secs(10)
+            ),
             Err(SuppressionReason::Cooldown)
         );
         assert!(gate
-            .check(&action(2), &policy, &executor, start + Duration::from_secs(10))
+            .check(
+                &action(2),
+                &policy,
+                &executor,
+                start + Duration::from_secs(10)
+            )
             .is_ok());
         assert!(gate
-            .check(&action(1), &policy, &executor, start + Duration::from_secs(61))
+            .check(
+                &action(1),
+                &policy,
+                &executor,
+                start + Duration::from_secs(61)
+            )
             .is_ok());
     }
 
@@ -524,8 +540,14 @@ mod tests {
 
         #[cfg(windows)]
         {
-            assert!(is_protected_image("C:\\Windows\\System32\\lsass.exe", &configured));
-            assert!(is_protected_image("c:\\windows\\system32\\CSRSS.EXE", &configured));
+            assert!(is_protected_image(
+                "C:\\Windows\\System32\\lsass.exe",
+                &configured
+            ));
+            assert!(is_protected_image(
+                "c:\\windows\\system32\\CSRSS.EXE",
+                &configured
+            ));
             assert!(!is_protected_image("C:\\tmp\\evil.exe", &configured));
         }
         #[cfg(target_os = "linux")]

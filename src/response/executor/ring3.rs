@@ -71,7 +71,9 @@ impl ActionExecutor for Ring3Executor {
                     kind: ActionKind::SuspendProcess,
                     reason,
                 })?;
-                Ok(receipt(Some("process suspended; resume it to release".to_string())))
+                Ok(receipt(Some(
+                    "process suspended; resume it to release".to_string(),
+                )))
             }
             other => Err(ActionError::Unsupported {
                 kind: other.kind(),

@@ -53,7 +53,7 @@ impl Target {
             command
         };
 
-        let child = command
+        let mut child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -67,6 +67,9 @@ impl Target {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
+        // Reap before failing; `Drop` never runs on this path.
+        let _ = child.kill();
+        let _ = child.wait();
         panic!("could not read the identity of the spawned target process");
     }
 
@@ -145,7 +148,12 @@ fn alert_for(
 }
 
 fn critical_sigma_alert(target: &Target, tags: &[&str]) -> Alert {
-    alert_for(target, AlertSeverity::Critical, DetectionEngine::Sigma, tags)
+    alert_for(
+        target,
+        AlertSeverity::Critical,
+        DetectionEngine::Sigma,
+        tags,
+    )
 }
 
 fn rule(actions: &[&str]) -> ResponseRule {

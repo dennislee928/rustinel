@@ -855,8 +855,8 @@ pub(super) fn decode_remote_thread(
     record: &EventRecord,
 ) -> Option<DecodedEtwEvent> {
     let source_pid = record.process_id();
-    let target_pid = try_get_uint_as_u64(parser, "ProcessID")
-        .and_then(|value| u32::try_from(value).ok())?;
+    let target_pid =
+        try_get_uint_as_u64(parser, "ProcessID").and_then(|value| u32::try_from(value).ok())?;
 
     if target_pid == source_pid {
         return None;

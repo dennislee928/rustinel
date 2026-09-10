@@ -89,8 +89,16 @@ impl PreparedRule {
 
         Self {
             name,
-            rule_ids: rule.rule_ids.iter().map(|id| id.trim().to_string()).collect(),
-            rule_names: rule.rule_names.iter().map(|p| GlobPattern::new(p)).collect(),
+            rule_ids: rule
+                .rule_ids
+                .iter()
+                .map(|id| id.trim().to_string())
+                .collect(),
+            rule_names: rule
+                .rule_names
+                .iter()
+                .map(|p| GlobPattern::new(p))
+                .collect(),
             tags: rule.tags.iter().map(|p| GlobPattern::new(p)).collect(),
             categories: rule
                 .categories
@@ -591,13 +599,17 @@ mod tests {
             ..rule(&["terminate_process"])
         }]);
 
-        assert!(policy.match_alert(&alert_with(AlertShape::default())).is_some());
+        assert!(policy
+            .match_alert(&alert_with(AlertShape::default()))
+            .is_some());
 
         let other = prepared(vec![ResponseRule {
             categories: vec!["registry_set".to_string()],
             ..rule(&["terminate_process"])
         }]);
-        assert!(other.match_alert(&alert_with(AlertShape::default())).is_none());
+        assert!(other
+            .match_alert(&alert_with(AlertShape::default()))
+            .is_none());
     }
 
     #[test]

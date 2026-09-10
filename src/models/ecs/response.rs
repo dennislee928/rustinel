@@ -78,7 +78,10 @@ pub struct EcsResponse {
     pub edr_response_decision: String,
 
     /// Why, for anything that did not simply succeed.
-    #[serde(rename = "edr.response.reason", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "edr.response.reason",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub edr_response_reason: Option<String>,
 
     /// Executor that handled it.
