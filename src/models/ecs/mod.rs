@@ -145,6 +145,10 @@ impl From<&Alert> for EcsAlert {
             edr_remote_thread_start_address: None,
             edr_remote_thread_start_module: None,
             edr_remote_thread_start_function: None,
+            edr_process_access_target_pid: None,
+            edr_process_access_target_image: None,
+            edr_process_access_granted_access: None,
+            edr_process_access_target_thread_id: None,
             edr_process_target_image: None,
             edr_security: None,
             related_ip: None,
@@ -305,6 +309,17 @@ impl From<&Alert> for EcsAlert {
                 ecs.edr_remote_thread_start_address = f.start_address.clone();
                 ecs.edr_remote_thread_start_module = f.start_module.clone();
                 ecs.edr_remote_thread_start_function = f.start_function.clone();
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
+            EventFields::ProcessAccess(f) => {
+                // The caller is the subject of the event: it is the process
+                // that asked for the handle, and the one response acts on.
+                ecs.process_executable = f.source_image.clone();
+                ecs.process_pid = parse_u64(&f.source_process_id);
+                ecs.edr_process_access_target_pid = parse_u64(&f.target_process_id);
+                ecs.edr_process_access_target_image = f.target_image.clone();
+                ecs.edr_process_access_granted_access = f.granted_access.clone();
+                ecs.edr_process_access_target_thread_id = parse_u64(&f.target_thread_id);
                 apply_user_fields(&mut ecs, f.user.as_deref());
             }
             EventFields::SecurityAudit(f) => {

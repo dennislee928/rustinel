@@ -482,6 +482,37 @@ pub struct EcsAlert {
     )]
     pub edr_remote_thread_start_module: Option<String>,
 
+    /// Process whose handle was requested.
+    #[serde(
+        rename = "edr.process_access.target_pid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_target_pid: Option<u64>,
+
+    /// Image of the process whose handle was requested.
+    #[serde(
+        rename = "edr.process_access.target_image",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_target_image: Option<String>,
+
+    /// Access mask requested, formatted as Sysmon writes it (`0x1010`).
+    ///
+    /// Windows reports the requested access and grants at most that, so this
+    /// is an upper bound on what the caller received.
+    #[serde(
+        rename = "edr.process_access.granted_access",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_granted_access: Option<String>,
+
+    /// Thread whose handle was requested, when the access was to a thread.
+    #[serde(
+        rename = "edr.process_access.target_thread_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_target_thread_id: Option<u64>,
+
     #[serde(
         rename = "edr.remote_thread.start_function",
         skip_serializing_if = "Option::is_none"

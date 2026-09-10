@@ -27,6 +27,14 @@ impl EtwProviders {
     pub(super) const POWERSHELL_GUID: &'static str = "A0C1853B-5C40-4B15-8766-3CF1C58F985A";
     pub(super) const WMI_ACTIVITY_GUID: &'static str = "1418EF04-B0B4-4623-BF7E-D74AB47BBDAA";
     pub(super) const TASK_SCHEDULER_GUID: &'static str = "de7b24ea-73c8-4a09-985d-5bdadcfa9017";
+    /// Microsoft-Windows-Kernel-Audit-API-Calls.
+    ///
+    /// Undocumented, but the only source of cross-process handle telemetry
+    /// available without a kernel driver: `Microsoft-Windows-Threat-Intelligence`
+    /// is gated behind Protected Process Light, and Sysmon's event 10 needs
+    /// Sysmon's own driver. Event 5 is `OpenProcess` and event 6 is
+    /// `OpenThread`, both carrying the target and the requested access.
+    pub(super) const KERNEL_AUDIT_API_GUID: &'static str = "e02a841c-75a3-4fa7-afc8-ae09cf9b7f23";
 
     // Keyword names follow the Microsoft-Windows-Kernel-File manifest.
     pub(super) const KERNEL_FILE_KEYWORD_FILENAME: u64 = 0x0010;
@@ -73,9 +81,29 @@ impl EtwProviders {
         | Self::REG_KEYWORD_DELETE_KEY;
 
     pub(super) const WINEVENT_KEYWORD_PROCESS: u64 = 0x0010;
+    pub(super) const WINEVENT_KEYWORD_THREAD: u64 = 0x0020;
     pub(super) const WINEVENT_KEYWORD_IMAGE: u64 = 0x0040;
     pub(super) const PROCESS_KEYWORDS: u64 =
         Self::WINEVENT_KEYWORD_PROCESS | Self::WINEVENT_KEYWORD_IMAGE;
+
+    /// Kernel-Process thread events, subscribed separately from the process
+    /// and image events above.
+    ///
+    /// Thread creation is one of the highest-rate events on a Windows box: a
+    /// busy machine starts thousands a second, and all but a handful are a
+    /// process starting its own threads. Putting them on the low-latency
+    /// process session would drown the one stream whose latency matters, so
+    /// they are enabled as a second subscription to the same provider, with
+    /// only the thread keyword, on the burst-tolerant main session.
+    pub(super) const THREAD_KEYWORDS: u64 = Self::WINEVENT_KEYWORD_THREAD;
+    /// ThreadStart only. ThreadStop says nothing about who created the thread.
+    pub(super) const THREAD_EVENT_IDS: &'static [u16] = &[3];
+    /// `OpenProcess` (5) and `OpenThread` (6).
+    ///
+    /// The provider also emits driver load and unload (7, 8) and a handful of
+    /// other audited calls; those are left unsubscribed rather than collected
+    /// and dropped.
+    pub(super) const KERNEL_AUDIT_API_EVENT_IDS: &'static [u16] = &[5, 6];
 
     pub(super) const NETWORK_KEYWORD_TCPIP: u64 = 0x10;
     pub(super) const NETWORK_KEYWORD_UDP: u64 = 0x20;
@@ -119,6 +147,27 @@ impl EtwProviders {
             level: 4,
             keywords: Self::PROCESS_KEYWORDS,
             event_ids: &[],
+        }
+    }
+
+    /// Kernel-Process, thread events only, for the main session.
+    pub(super) fn kernel_process_threads() -> EtwProvider {
+        EtwProvider {
+            guid: GUID::from(Self::KERNEL_PROCESS_GUID),
+            name: "Microsoft-Windows-Kernel-Process",
+            level: 4,
+            keywords: Self::THREAD_KEYWORDS,
+            event_ids: Self::THREAD_EVENT_IDS,
+        }
+    }
+
+    pub(super) fn kernel_audit_api() -> EtwProvider {
+        EtwProvider {
+            guid: GUID::from(Self::KERNEL_AUDIT_API_GUID),
+            name: "Microsoft-Windows-Kernel-Audit-API-Calls",
+            level: 4,
+            keywords: 0,
+            event_ids: Self::KERNEL_AUDIT_API_EVENT_IDS,
         }
     }
 
@@ -210,6 +259,8 @@ impl EtwProviders {
     /// Providers on the main, burst-tolerant session.
     pub(super) fn main_session() -> Vec<EtwProvider> {
         vec![
+            Self::kernel_process_threads(),
+            Self::kernel_audit_api(),
             Self::kernel_network(),
             Self::kernel_file(),
             Self::kernel_registry(),
@@ -227,6 +278,8 @@ impl EtwProviders {
     pub(super) fn all() -> Vec<EtwProvider> {
         vec![
             Self::kernel_process(),
+            Self::kernel_process_threads(),
+            Self::kernel_audit_api(),
             Self::kernel_network(),
             Self::kernel_file(),
             Self::kernel_registry(),
@@ -296,14 +349,58 @@ mod tests {
     }
 
     #[test]
-    fn provider_guids_are_unique() {
+    fn thread_events_are_scoped_away_from_the_low_latency_session() {
+        let threads = EtwProviders::kernel_process_threads();
+        let processes = EtwProviders::kernel_process();
+
+        assert_eq!(threads.guid, processes.guid, "same provider, two scopes");
+        assert_eq!(threads.keywords, EtwProviders::WINEVENT_KEYWORD_THREAD);
+        assert_eq!(
+            threads.keywords & processes.keywords,
+            0,
+            "overlapping keywords would deliver an event on both sessions"
+        );
+        // ThreadStart only: a stop event does not name who created the thread.
+        assert_eq!(threads.event_ids, &[3]);
+
+        let main: Vec<&str> = EtwProviders::main_session()
+            .iter()
+            .map(|provider| provider.name)
+            .collect();
+        assert!(main.contains(&"Microsoft-Windows-Kernel-Process"));
+    }
+
+    #[test]
+    fn audit_api_subscription_matches_what_the_decoder_reads() {
+        let provider = EtwProviders::kernel_audit_api();
+
+        assert_eq!(
+            provider.event_ids,
+            &[
+                super::super::routing::KERNEL_AUDIT_API_EVENT_OPEN_PROCESS,
+                super::super::routing::KERNEL_AUDIT_API_EVENT_OPEN_THREAD,
+            ],
+            "an unsubscribed event id can never reach the router"
+        );
+        // The manifest declares no keywords, so filtering is by event ID alone.
+        assert_eq!(provider.keywords, 0);
+        assert!(EtwProviders::main_session()
+            .iter()
+            .any(|p| p.guid == provider.guid));
+    }
+
+    #[test]
+    fn provider_subscriptions_are_unique() {
+        // One GUID may appear more than once, because Kernel-Process is
+        // subscribed twice with different keywords, but two subscriptions that
+        // agree on both would be a copy-paste of the same provider.
         let providers = EtwProviders::all();
-        let mut guids = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
 
         for provider in providers {
             assert!(
-                guids.insert(format!("{:?}", provider.guid)),
-                "duplicate GUID found for provider: {}",
+                seen.insert((format!("{:?}", provider.guid), provider.keywords)),
+                "duplicate subscription for provider: {}",
                 provider.name
             );
         }

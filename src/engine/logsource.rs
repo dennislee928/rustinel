@@ -215,6 +215,8 @@ impl Engine {
                 | "dns_query"
                 | "dns"
                 | "image_load"
+                | "create_remote_thread"
+                | "process_access"
                 | "ps_script"
                 | "ps_module"
                 | "wmi_event"
@@ -295,6 +297,12 @@ impl Engine {
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_set")),
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_delete")),
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("image_load")),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("sysmon"),
+                    Some("create_remote_thread"),
+                ),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("process_access")),
                 LogSourceKey::from_parts(Some("windows"), Some("dns-client"), Some("dns_query")),
                 LogSourceKey::from_parts(Some("windows"), Some("dns"), Some("dns_query")),
                 LogSourceKey::from_parts(Some("windows"), Some("powershell"), Some("ps_script")),
@@ -587,6 +595,20 @@ impl Engine {
                     Some(platform_product(event.platform)),
                     Some("sysmon"),
                     Some("image_load"),
+                ));
+            }
+            EventCategory::RemoteThread => {
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("create_remote_thread"),
+                ));
+            }
+            EventCategory::ProcessAccess => {
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("process_access"),
                 ));
             }
             EventCategory::Scripting => {

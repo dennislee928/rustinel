@@ -42,8 +42,8 @@ Dominated by two Event Log channels and a few Sysmon categories:
 | 17 | `windefend` |
 | 15 | `create_remote_thread` |
 
-**Since this measurement**, two of these rows have moved. The table itself is
-left as measured; the next full run will absorb both.
+**Since this measurement**, four of these rows have moved. The table itself is
+left as measured; the next full run will absorb them.
 
 - The 34 `ps_module` rules are no longer blocked. Event 4103 is collected from
   the PowerShell provider
@@ -52,6 +52,16 @@ left as measured; the next full run will absorb both.
   to "can fire" (Windows 2,172 / 75.5%, blocked-on-collector 414 / 14.4%) once
   the host has Module Logging enabled. See
   [Detection](detection.md#powershell-logsources).
+- The 29 `process_access` and 15 `create_remote_thread` rules are no longer
+  blocked on a collector. Both families are now collected: thread starts from
+  `Microsoft-Windows-Kernel-Process`, and handle opens from
+  `Microsoft-Windows-Kernel-Audit-API-Calls`. Measured against the same pinned
+  corpus, all 44 move from "unknown logsource" to loaded against an active
+  collector, taking the pinned-corpus figure from 2,649 to 2,693. Note that
+  `process_access` is filtered in the sensor to opens requesting memory or
+  thread-creation rights, so a rule selecting on other access masks loads and
+  still cannot match; see
+  [Detection](detection.md#cross-process-telemetry).
 - The `security` row predates the Security channel collector
   ([#315](https://github.com/Karib0u/rustinel/issues/315)), which covers six
   audit event families in that channel. It has not been re-measured, and what

@@ -25,9 +25,9 @@ use tokio::sync::mpsc::Sender;
 
 use crate::models::{
     DnsQueryFields, EventCategory, EventFields, FileEventFields, ImageLoadFields,
-    NetworkConnectionFields, PowerShellModuleFields, PowerShellScriptFields, ProcessCreationFields,
-    RegistryEventFields, SecurityAuditFields, ServiceCreationFields, TaskCreationFields,
-    WmiEventFields,
+    NetworkConnectionFields, PowerShellModuleFields, PowerShellScriptFields, ProcessAccessFields,
+    ProcessCreationFields, RegistryEventFields, RemoteThreadFields, SecurityAuditFields,
+    ServiceCreationFields, TaskCreationFields, WmiEventFields,
 };
 
 /// Cross-platform sensor interface.
@@ -268,6 +268,8 @@ pub enum SensorPayload {
     Dns(DnsQueryFields),
     Registry(RegistryEventFields),
     ImageLoad(ImageLoadFields),
+    RemoteThread(RemoteThreadFields),
+    ProcessAccess(ProcessAccessFields),
     Scripting(PowerShellScriptFields),
     PowerShellModule(PowerShellModuleFields),
     Wmi(WmiEventFields),
@@ -286,6 +288,8 @@ impl SensorPayload {
             Self::Dns(_) => EventCategory::Dns,
             Self::Registry(_) => EventCategory::Registry,
             Self::ImageLoad(_) => EventCategory::ImageLoad,
+            Self::RemoteThread(_) => EventCategory::RemoteThread,
+            Self::ProcessAccess(_) => EventCategory::ProcessAccess,
             Self::Scripting(_) => EventCategory::Scripting,
             Self::PowerShellModule(_) => EventCategory::PowerShellModule,
             Self::Wmi(_) => EventCategory::Wmi,
@@ -305,6 +309,8 @@ impl SensorPayload {
             Self::Dns(fields) => EventFields::DnsQuery(fields),
             Self::Registry(fields) => EventFields::RegistryEvent(fields),
             Self::ImageLoad(fields) => EventFields::ImageLoad(fields),
+            Self::RemoteThread(fields) => EventFields::RemoteThread(fields),
+            Self::ProcessAccess(fields) => EventFields::ProcessAccess(fields),
             Self::Scripting(fields) => EventFields::PowerShellScript(fields),
             Self::PowerShellModule(fields) => EventFields::PowerShellModule(fields),
             Self::Wmi(fields) => EventFields::WmiEvent(fields),
@@ -326,6 +332,8 @@ impl TryFrom<EventFields> for SensorPayload {
             EventFields::DnsQuery(fields) => Ok(Self::Dns(fields)),
             EventFields::RegistryEvent(fields) => Ok(Self::Registry(fields)),
             EventFields::ImageLoad(fields) => Ok(Self::ImageLoad(fields)),
+            EventFields::RemoteThread(fields) => Ok(Self::RemoteThread(fields)),
+            EventFields::ProcessAccess(fields) => Ok(Self::ProcessAccess(fields)),
             EventFields::PowerShellScript(fields) => Ok(Self::Scripting(fields)),
             EventFields::PowerShellModule(fields) => Ok(Self::PowerShellModule(fields)),
             EventFields::WmiEvent(fields) => Ok(Self::Wmi(fields)),

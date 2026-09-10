@@ -128,9 +128,22 @@ three platforms, but several Sysmon-style fields are unavailable.
   A `windows/security` rule selecting on any other `EventID` loads, is counted
   as backed by an active collector, and can never match. The list is
   `SUPPORTED_EVENTS` in `src/sensor/windows/event_log/security.rs`.
-- **No injection, driver-load, or named-pipe visibility.** There is no
-  equivalent of CreateRemoteThread, ProcessAccess, pipe, or driver-load
-  telemetry, so injection-based TTPs leave little trace.
+- **No named-pipe or driver-load visibility.** There is no equivalent of
+  Sysmon's pipe events, and driver loads are not collected, so BYOVD and
+  named-pipe C2 leave little trace.
+- **Cross-process telemetry is narrower than Sysmon's.** `create_remote_thread`
+  and `process_access` are collected, but `process_access` is filtered in the
+  sensor to opens that requested memory-read, memory-write, thread-creation, or
+  handle-duplication rights, and reports the access *requested* rather than the
+  access granted. Rules selecting on other access masks load and can never
+  match. Neither family resolves a start address to a module or function, and
+  both resolve peer images from the process cache, so a process that predates
+  the agent resolves to no image.
+- **No memory-operation telemetry.** `VirtualAllocEx`, `WriteProcessMemory`, and
+  APC injection are visible only through
+  `Microsoft-Windows-Threat-Intelligence`, which requires the agent to run as a
+  Protected Process Light under a Microsoft-signed ELAM driver. Rustinel is
+  neither, so injection that never creates a thread is not seen.
 - **PowerShell telemetry depends on host policy.** Only Windows PowerShell 5.1
   is covered; PowerShell 7 (`pwsh`) uses a different provider and is not
   collected. Script block logging (4104) reaches the sensor for suspicious

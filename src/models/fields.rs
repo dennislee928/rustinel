@@ -22,6 +22,7 @@ pub enum EventFields {
     PowerShellScript(PowerShellScriptFields),
     PowerShellModule(PowerShellModuleFields),
     RemoteThread(RemoteThreadFields),
+    ProcessAccess(ProcessAccessFields),
     WmiEvent(WmiEventFields),
     ServiceCreation(ServiceCreationFields),
     TaskCreation(TaskCreationFields),
@@ -53,6 +54,10 @@ impl EventFields {
             EventCategory::Registry => serde_json::from_value(payload).map(Self::RegistryEvent),
             EventCategory::Dns => serde_json::from_value(payload).map(Self::DnsQuery),
             EventCategory::ImageLoad => serde_json::from_value(payload).map(Self::ImageLoad),
+            EventCategory::RemoteThread => serde_json::from_value(payload).map(Self::RemoteThread),
+            EventCategory::ProcessAccess => {
+                serde_json::from_value(payload).map(Self::ProcessAccess)
+            }
             EventCategory::Scripting => serde_json::from_value(payload).map(Self::PowerShellScript),
             EventCategory::PowerShellModule => {
                 serde_json::from_value(payload).map(Self::PowerShellModule)
@@ -364,6 +369,42 @@ pub struct RemoteThreadFields {
 
     #[serde(rename = "StartFunction", skip_serializing_if = "Option::is_none")]
     pub start_function: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Cross-process handle access fields (Sigma: process_access).
+///
+/// One process asked the object manager for a handle to another. The interesting
+/// part is `GrantedAccess`: a handle carrying `PROCESS_VM_READ` on `lsass.exe`
+/// is what credential dumping looks like from outside, and one carrying
+/// `PROCESS_VM_WRITE | PROCESS_CREATE_THREAD` is what injection looks like.
+///
+/// Windows reports the *requested* access in the ETW record, and grants at most
+/// that, so the value is an upper bound on what the caller received rather than
+/// proof it received all of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessAccessFields {
+    #[serde(rename = "SourceProcessId", skip_serializing_if = "Option::is_none")]
+    pub source_process_id: Option<String>,
+
+    #[serde(rename = "SourceImage", skip_serializing_if = "Option::is_none")]
+    pub source_image: Option<String>,
+
+    #[serde(rename = "TargetProcessId", skip_serializing_if = "Option::is_none")]
+    pub target_process_id: Option<String>,
+
+    #[serde(rename = "TargetImage", skip_serializing_if = "Option::is_none")]
+    pub target_image: Option<String>,
+
+    /// Access mask, formatted as Sysmon writes it (`0x1010`).
+    #[serde(rename = "GrantedAccess", skip_serializing_if = "Option::is_none")]
+    pub granted_access: Option<String>,
+
+    /// Thread ID, when the access was to a thread rather than a process.
+    #[serde(rename = "TargetThreadId", skip_serializing_if = "Option::is_none")]
+    pub target_thread_id: Option<String>,
 
     #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,

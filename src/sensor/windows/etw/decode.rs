@@ -9,12 +9,13 @@ use super::parser::{
 use super::routing::{
     kernel_file_route, kernel_registry_route, refine_file_create_action,
     refine_registry_create_action, set_information_action, KernelFileRoute, KernelRegistryRoute,
+    KERNEL_AUDIT_API_EVENT_OPEN_THREAD,
 };
 use super::state::{EtwState, PendingRegistryEvent};
 use crate::models::{
     DnsQueryFields, EventCategory, FileEventFields, ImageLoadFields, NetworkConnectionFields,
-    PowerShellModuleFields, PowerShellScriptFields, ProcessCreationFields, RegistryEventFields,
-    TaskCreationFields, WmiEventFields,
+    PowerShellModuleFields, PowerShellScriptFields, ProcessAccessFields, ProcessCreationFields,
+    RegistryEventFields, RemoteThreadFields, TaskCreationFields, WmiEventFields,
 };
 use crate::sensor::integrity_level::integrity_level_from_sid;
 use crate::sensor::network_events::classify_kernel_network_event;
@@ -154,6 +155,8 @@ pub(super) fn decode_single_record(
         EventCategory::Registry => unreachable!("kernel-registry records are diverted above"),
         EventCategory::Dns => decode_dns(&parser, record),
         EventCategory::ImageLoad => decode_image_load(&parser, record),
+        EventCategory::RemoteThread => decode_remote_thread(&parser, record),
+        EventCategory::ProcessAccess => decode_process_access(&parser, record),
         EventCategory::Scripting => decode_powershell(&parser, record),
         EventCategory::PowerShellModule => decode_powershell_module(&parser, record),
         EventCategory::Wmi => decode_wmi(&parser, record),
@@ -813,6 +816,131 @@ pub(super) fn decode_image_load(parser: &Parser, record: &EventRecord) -> Option
         pid: parse_optional_u32(fields.process_id.as_deref()).or(Some(record.process_id())),
         process_start_key: None,
         payload: SensorPayload::ImageLoad(fields),
+    })
+}
+
+/// Process access rights that make a handle worth reporting.
+///
+/// `PROCESS_CREATE_THREAD`, `PROCESS_VM_OPERATION`, `PROCESS_VM_READ`,
+/// `PROCESS_VM_WRITE`, and `PROCESS_DUP_HANDLE`. Reading another process's
+/// memory is the shape of credential dumping; writing it and creating a thread
+/// there is the shape of injection; duplicating its handles is the shape of
+/// token theft.
+///
+/// Everything else, overwhelmingly `PROCESS_QUERY_LIMITED_INFORMATION` and
+/// `SYNCHRONIZE`, is what every task manager, installer, and monitoring agent
+/// on the machine does constantly. Filtering on this mask before anything else
+/// is what makes the provider affordable to subscribe to at all.
+const INTERESTING_PROCESS_ACCESS: u64 = 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040;
+
+/// Thread access rights that make a handle worth reporting.
+///
+/// `THREAD_SUSPEND_RESUME`, `THREAD_GET_CONTEXT`, `THREAD_SET_CONTEXT`, and
+/// `THREAD_SET_THREAD_TOKEN`: between them, thread hijacking.
+const INTERESTING_THREAD_ACCESS: u64 = 0x0002 | 0x0008 | 0x0010 | 0x0080;
+
+/// Decode a Kernel-Process `ThreadStart` into a remote-thread event.
+///
+/// Returns `None` for the overwhelming majority of thread starts, which are a
+/// process starting a thread in itself. Only a start where the creating process
+/// differs from the process the thread belongs to is injection-shaped, and that
+/// comparison needs the payload, so it cannot be made before the schema lookup.
+///
+/// The creator is `record.process_id()`, the ETW header's owner of the calling
+/// thread. The new thread's process is the payload's `ProcessID`. Images are
+/// left for the normalizer, which has the process cache; a bare PID is all the
+/// record carries.
+pub(super) fn decode_remote_thread(
+    parser: &Parser,
+    record: &EventRecord,
+) -> Option<DecodedEtwEvent> {
+    let source_pid = record.process_id();
+    let target_pid = try_get_uint_as_u64(parser, "ProcessID")
+        .and_then(|value| u32::try_from(value).ok())?;
+
+    if target_pid == source_pid {
+        return None;
+    }
+
+    let fields = RemoteThreadFields {
+        source_process_id: Some(source_pid.to_string()),
+        source_image: None,
+        target_process_id: Some(target_pid.to_string()),
+        target_image: None,
+        start_address: try_get_uint_as_u64(parser, "StartAddr")
+            .map(|address| format!("0x{address:016X}")),
+        start_module: None,
+        start_function: None,
+        user: None,
+    };
+
+    Some(DecodedEtwEvent {
+        pid: Some(source_pid),
+        process_start_key: None,
+        payload: SensorPayload::RemoteThread(fields),
+    })
+}
+
+/// Decode a Kernel-Audit-API-Calls `OpenProcess` (5) or `OpenThread` (6).
+///
+/// Three filters run here rather than downstream, because this provider is one
+/// of the highest-rate on Windows and everything past this point costs more:
+/// a process opening itself is dropped, a failed open is dropped, and an open
+/// that asked for none of the dangerous access rights is dropped.
+///
+/// `DesiredAccess` is what was requested. Windows grants at most that, so the
+/// value written into `GrantedAccess` is an upper bound rather than a record of
+/// what was received. The field carries Sysmon's name because that is the name
+/// rules read.
+pub(super) fn decode_process_access(
+    parser: &Parser,
+    record: &EventRecord,
+) -> Option<DecodedEtwEvent> {
+    let source_pid = record.process_id();
+    let target_pid = try_get_uint_as_u64(parser, "TargetProcessId")
+        .and_then(|value| u32::try_from(value).ok())?;
+
+    if target_pid == source_pid {
+        return None;
+    }
+
+    // `ReturnCode` is an NTSTATUS; zero is success. A record without one is
+    // kept rather than guessed at.
+    if try_get_uint_as_u64(parser, "ReturnCode").is_some_and(|status| status != 0) {
+        return None;
+    }
+
+    let desired_access = try_get_uint_as_u64(parser, "DesiredAccess")?;
+    let is_thread = record.event_id() == KERNEL_AUDIT_API_EVENT_OPEN_THREAD;
+    let interesting = if is_thread {
+        INTERESTING_THREAD_ACCESS
+    } else {
+        INTERESTING_PROCESS_ACCESS
+    };
+
+    if desired_access & interesting == 0 {
+        return None;
+    }
+
+    let fields = ProcessAccessFields {
+        source_process_id: Some(source_pid.to_string()),
+        source_image: None,
+        target_process_id: Some(target_pid.to_string()),
+        target_image: None,
+        granted_access: Some(format!("0x{desired_access:X}")),
+        // Present on OpenThread only. The manifest spells it `TargetThreatId`,
+        // which is a typo in Microsoft's own template; both spellings are read
+        // so a corrected manifest would not silently drop the field.
+        target_thread_id: try_get_uint_as_u64(parser, "TargetThreatId")
+            .or_else(|| try_get_uint_as_u64(parser, "TargetThreadId"))
+            .map(|id| id.to_string()),
+        user: None,
+    };
+
+    Some(DecodedEtwEvent {
+        pid: Some(source_pid),
+        process_start_key: None,
+        payload: SensorPayload::ProcessAccess(fields),
     })
 }
 

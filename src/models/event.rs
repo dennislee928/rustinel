@@ -300,11 +300,30 @@ impl NormalizedEvent {
             EventFields::RemoteThread(f) => match key {
                 "SourceProcessId" => f.source_process_id.as_deref(),
                 "SourceImage" => f.source_image.as_deref(),
+                // Sigma's create_remote_thread rules read the creator as
+                // `Image` and `ProcessId` as often as they read the explicit
+                // Source* names, so both spellings resolve.
+                "Image" => f.source_image.as_deref(),
+                "ProcessId" => f.source_process_id.as_deref(),
                 "TargetProcessId" => f.target_process_id.as_deref(),
                 "TargetImage" => f.target_image.as_deref(),
                 "StartAddress" => f.start_address.as_deref(),
                 "StartModule" => f.start_module.as_deref(),
                 "StartFunction" => f.start_function.as_deref(),
+                "User" => f.user.as_deref(),
+                _ => None,
+            },
+            EventFields::ProcessAccess(f) => match key {
+                "SourceProcessId" => f.source_process_id.as_deref(),
+                "SourceImage" => f.source_image.as_deref(),
+                // As above: the caller is the subject of the event, so it
+                // answers to the generic field names too.
+                "Image" => f.source_image.as_deref(),
+                "ProcessId" => f.source_process_id.as_deref(),
+                "TargetProcessId" => f.target_process_id.as_deref(),
+                "TargetImage" => f.target_image.as_deref(),
+                "GrantedAccess" => f.granted_access.as_deref(),
+                "TargetThreadId" => f.target_thread_id.as_deref(),
                 "User" => f.user.as_deref(),
                 _ => None,
             },
@@ -360,6 +379,10 @@ pub enum EventCategory {
     Registry,
     Dns,
     ImageLoad,
+    /// A thread created in another process: the shape of code injection.
+    RemoteThread,
+    /// A handle opened to another process or thread.
+    ProcessAccess,
     Scripting,
     PowerShellModule,
     Wmi,

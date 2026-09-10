@@ -29,6 +29,10 @@ fn action_code_for_record(
 ) -> u8 {
     match category {
         EventCategory::Process | EventCategory::ImageLoad => record.opcode(),
+        // Both come from manifest providers whose opcode is 0; the routed
+        // action is what distinguishes them, and there is one action each.
+        EventCategory::RemoteThread => 0,
+        EventCategory::ProcessAccess => 0,
         EventCategory::Network => match action {
             SensorAction::Connect => 12,
             SensorAction::Disconnect => 13,
@@ -80,6 +84,8 @@ fn registry_action_code(action: SensorAction) -> u8 {
 fn raw_event_id_for_record(category: EventCategory, action_code: u8, record: &EventRecord) -> u16 {
     match category {
         EventCategory::Process | EventCategory::ImageLoad => record.event_id(),
+        EventCategory::RemoteThread => record.event_id(),
+        EventCategory::ProcessAccess => record.event_id(),
         EventCategory::Network => record.event_id(),
         EventCategory::File => u16::from(action_code),
         EventCategory::Registry => u16::from(action_code),
@@ -123,6 +129,10 @@ pub fn map_to_sysmon_id(category: EventCategory, action_code: u8, raw_event_id: 
             12 | 15 => 3,
             _ => raw_event_id,
         },
+        // Sysmon's own IDs for the two, so stock SigmaHQ rules that select on
+        // EventID rather than on logsource still match.
+        EventCategory::RemoteThread => 8,
+        EventCategory::ProcessAccess => 10,
         EventCategory::Dns => 22,
         EventCategory::Wmi
         | EventCategory::Scripting

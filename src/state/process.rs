@@ -61,6 +61,17 @@ pub struct ProcessCache {
     cache: RwLock<HashMap<(u32, u64), ProcessMetadata>>,
     /// Compound keys ordered by creation time for efficient oldest-first eviction
     eviction_order: RwLock<BTreeSet<(u64, u32)>>,
+    /// Secondary index: PID -> creation time of the newest process seen under
+    /// that PID.
+    ///
+    /// Cross-process events name their peers by bare PID and nothing else: an
+    /// `OpenProcess` record says which PID was opened, never when that process
+    /// started. Resolving that to an image needs a PID-only lookup, and the
+    /// primary map is keyed by the compound identity precisely so a bare PID
+    /// cannot be looked up by accident. This index answers the question the
+    /// only way it can be answered, with the newest process under the PID, and
+    /// is deliberately separate so the ambiguity stays visible at the call site.
+    by_pid: RwLock<HashMap<u32, u64>>,
     max_entries: usize,
     /// Recently-dead processes retained briefly to avoid parent/child race conditions
     graveyard: RwLock<HashMap<(u32, u64), GraveyardEntry>>,
@@ -78,6 +89,7 @@ impl ProcessCache {
         Self {
             cache: RwLock::new(HashMap::new()),
             eviction_order: RwLock::new(BTreeSet::new()),
+            by_pid: RwLock::new(HashMap::new()),
             max_entries,
             graveyard: RwLock::new(HashMap::new()),
             last_graveyard_cleanup: AtomicU64::new(0),
@@ -146,12 +158,24 @@ impl ProcessCache {
             );
             eviction_order.insert((creation_time, pid));
 
+            let mut by_pid = self.by_pid.write().unwrap();
+            // A PID is reused, so only move the index forward.
+            match by_pid.get(&pid) {
+                Some(known) if *known > creation_time => {}
+                _ => {
+                    by_pid.insert(pid, creation_time);
+                }
+            }
+
             while cache.len() > self.max_entries {
                 let Some((oldest_creation_time, oldest_pid)) = eviction_order.pop_first() else {
                     break;
                 };
 
                 cache.remove(&(oldest_pid, oldest_creation_time));
+                if by_pid.get(&oldest_pid) == Some(&oldest_creation_time) {
+                    by_pid.remove(&oldest_pid);
+                }
             }
         }
 
@@ -171,6 +195,13 @@ impl ProcessCache {
 
             let meta = cache.remove(&(pid, creation_time));
             eviction_order.remove(&(creation_time, pid));
+
+            // Leave the index pointing at a newer process under the same PID.
+            let mut by_pid = self.by_pid.write().unwrap();
+            if by_pid.get(&pid) == Some(&creation_time) {
+                by_pid.remove(&pid);
+            }
+
             meta
         };
 
@@ -206,6 +237,20 @@ impl ProcessCache {
             return None;
         }
         Some(entry.metadata.clone())
+    }
+
+    /// Resolve a bare PID to the image of the newest process seen under it.
+    ///
+    /// Used only for the peer of a cross-process event, which names its target
+    /// by PID alone. A PID is reused, so this can name the wrong process if the
+    /// original exited and its number was recycled between the two events; that
+    /// is why nothing acts on the result, and why response reads the *source*
+    /// of such an event, whose identity is revalidated before anything happens
+    /// to it.
+    pub fn get_image_by_pid(&self, pid: u32) -> Option<String> {
+        let creation_time = *self.by_pid.read().unwrap().get(&pid)?;
+        self.get_metadata_by_key(pid, creation_time)
+            .map(|meta| meta.image_name)
     }
 
     /// Get the current count of cached processes

@@ -687,6 +687,8 @@ pub fn event_fields_from_payload(event: SensorEvent) -> EventFields {
         SensorPayload::Dns(fields) => EventFields::DnsQuery(fields),
         SensorPayload::Registry(fields) => EventFields::RegistryEvent(fields),
         SensorPayload::ImageLoad(fields) => EventFields::ImageLoad(fields),
+        SensorPayload::RemoteThread(fields) => EventFields::RemoteThread(fields),
+        SensorPayload::ProcessAccess(fields) => EventFields::ProcessAccess(fields),
         SensorPayload::Scripting(fields) => EventFields::PowerShellScript(fields),
         SensorPayload::PowerShellModule(fields) => EventFields::PowerShellModule(fields),
         SensorPayload::Wmi(fields) => EventFields::WmiEvent(fields),
