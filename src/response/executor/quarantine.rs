@@ -98,6 +98,20 @@ impl QuarantineStore {
             fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
         let id = hex::encode(Sha256::digest(&contents));
 
+        // A cross-volume quarantine is a copy followed by a delete rather than
+        // a rename, which is slower and leaves a window where the file exists
+        // twice. It is allowed, but it is worth saying so: an operator whose
+        // quarantine lives on a different disk from the malware is paying for
+        // it on every action.
+        if !same_volume(path, &self.root) {
+            tracing::debug!(
+                target: "response",
+                file = %path.display(),
+                quarantine = %self.root.display(),
+                "Quarantine is on a different volume from the file; the move is a copy"
+            );
+        }
+
         fs::create_dir_all(&self.root)
             .map_err(|err| format!("cannot create {}: {err}", self.root.display()))?;
         restrict_directory(&self.root);
@@ -228,6 +242,40 @@ impl QuarantineStore {
     }
 }
 
+/// Whether two paths are on the same volume.
+///
+/// Compared by path prefix rather than by device id, because a device id needs
+/// a handle to each path and the destination may not exist yet.
+fn same_volume(left: &Path, right: &Path) -> bool {
+    fn volume(path: &Path) -> Option<String> {
+        let text = path.to_string_lossy().to_ascii_lowercase();
+
+        #[cfg(windows)]
+        {
+            // `c:\...` or a UNC share root.
+            const SEPARATOR: char = '\\';
+            match text.strip_prefix(r"\\") {
+                Some(stripped) => stripped.split(SEPARATOR).next().map(str::to_string),
+                None => text.split(':').next().map(str::to_string),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Without mount-point resolution every absolute path is treated as
+            // one volume, which is true often enough and never claims a move
+            // is cheap when it is not.
+            let _ = text;
+            Some("/".to_string())
+        }
+    }
+
+    match (volume(left), volume(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
 /// Write a file, refusing to clobber one that is already there.
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = fs::OpenOptions::new()
@@ -249,9 +297,91 @@ fn restrict_directory(root: &Path) {
     let _ = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
 }
 
-/// On Windows the directory inherits the ACL of `C:\ProgramData\Rustinel`,
-/// which the installer restricts to SYSTEM and Administrators.
-#[cfg(not(unix))]
+/// Restrict the directory to SYSTEM, Administrators, and the agent's own account.
+///
+/// The quarantine holds live malware. A directory inheriting an ACL that lets
+/// interactive users read it turns the quarantine into a distribution point,
+/// and one that lets them write it turns a restore into an arbitrary file write
+/// by whoever owns the agent.
+///
+/// The account the agent runs as is granted alongside the two well-known ones,
+/// because it is not always SYSTEM: a portable install runs as an ordinary
+/// user, and an ACL that omits it locks the agent out of its own quarantine.
+///
+/// `icacls` is used rather than the security APIs because building a DACL by
+/// hand is a great deal of unsafe code for a directory created once, and
+/// because the result is inspectable by an administrator afterwards.
+#[cfg(windows)]
+fn restrict_directory(root: &Path) {
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new("icacls");
+    command.arg(root);
+    // Drop inherited entries first; without this the grants below are
+    // additions to whatever the parent directory already allowed.
+    command.args(["/inheritance:r"]);
+    command.args(["/grant:r", "*S-1-5-18:(OI)(CI)F"]);
+    command.args(["/grant:r", "*S-1-5-32-544:(OI)(CI)F"]);
+
+    if let Some(sid) = current_user_sid() {
+        command.args(["/grant:r", &format!("*{sid}:(OI)(CI)F")]);
+    }
+
+    let result = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
+
+    if !result.is_ok_and(|status| status.success()) {
+        tracing::warn!(
+            target: "response",
+            directory = %root.display(),
+            "Could not restrict the quarantine directory; it may be readable by other users"
+        );
+    }
+}
+
+/// The SID of the account this process runs as, in string form.
+#[cfg(windows)]
+fn current_user_sid() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+
+        // Ask for the size first: a TOKEN_USER carries the SID inline after
+        // the struct, so its length is not known ahead of time.
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return None;
+        }
+
+        let mut buffer = vec![0u8; needed as usize];
+        let queried = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        queried.ok()?;
+
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let mut raw = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut raw).ok()?;
+
+        let sid = raw.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(raw.0.cast())));
+        sid
+    }
+}
+
+/// Nothing to do on platforms that are neither Unix nor Windows.
+#[cfg(not(any(unix, windows)))]
 fn restrict_directory(_root: &Path) {}
 
 /// Paths that must never be quarantined, whatever a rule says.

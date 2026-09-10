@@ -244,6 +244,7 @@ pub fn inspect_with_options(options: ConfigLoadOptions) -> DoctorReport {
             results.extend(rule_validation_results(&cfg, platform));
             results.extend(platform_prerequisite_results());
             results.extend(crate::doctor::posture::posture_results());
+            results.extend(crate::doctor::response::response_results(&cfg.response));
 
             let (pipeline_results, telemetry) = telemetry_results(&cfg, &paths.logs_dir);
             results.extend(pipeline_results);

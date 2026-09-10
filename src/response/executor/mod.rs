@@ -15,6 +15,7 @@
 //! is the seam a future signed driver would fill, and it reports every action
 //! as unsupported until that driver exists.
 
+pub mod asep;
 pub mod quarantine;
 pub mod ring3;
 pub mod wfp;

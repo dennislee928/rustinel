@@ -94,11 +94,33 @@ named that subject can drive them.
 An action whose subject is absent is suppressed with `missing_target`, not
 applied to a substitute.
 
+### Reverting the registry
+
+A persistence value that did not exist before the attack is deleted, because for
+that one deletion *is* the original state.
+
+A value that did exist is restored instead. Winlogon's `Userinit` and a service's
+`ImagePath` are modified by an attacker rather than created, and deleting one
+breaks the logon path or the service rather than repairing it.
+
+Knowing which is which needs the previous value, and a registry event never
+carries one: it says what was written, never what was there before. So the agent
+reads the auto-start keys at startup and keeps that snapshot for the life of the
+process. The limit is worth stating plainly: a restore returns the value to its
+state when the agent started, not to its state immediately before the attack.
+For the auto-start keys those are nearly always the same, because legitimate
+writes to them are rare.
+
 ### Quarantine
 
 A file is moved into `response.quarantine_directory` under its SHA-256, stored
 with its bytes obfuscated, and accompanied by a metadata document naming where
 it came from. Restoring reproduces the original exactly.
+
+On Windows the directory is restricted to SYSTEM, Administrators, and the
+account the agent runs as. It holds live malware: an inherited ACL that lets
+interactive users read it turns the quarantine into a distribution point, and
+one that lets them write it turns a restore into an arbitrary file write.
 
 The obfuscation is a single-byte XOR. It is not encryption and is not claimed to
 be: it exists so the quarantine directory does not read as a malware collection
@@ -115,6 +137,17 @@ Isolation refuses to run unless `[response.actions.isolate_host]` names at least
 one exception. Cutting off a machine reachable only over the network it just
 lost is an outage the agent cannot undo remotely, so the empty case is treated
 as an operator who has not decided rather than one who wants everything blocked.
+
+Exceptions are networks, not addresses. `allow_cidrs = ["10.0.0.0/8"]` keeps the
+whole range reachable, and a bare address is treated as a host route. An entry
+that is not an address or a network is refused before anything is installed
+rather than silently dropped, because an exception the operator believes is in
+force and is not is how a machine gets stranded. `rustinel doctor` reports the
+same thing ahead of time.
+
+Loopback is permitted unconditionally and is not configurable. A host that
+cannot reach itself loses local inter-process communication over TCP, which
+breaks software that has nothing to do with the incident.
 
 Filters are installed under Rustinel's own WFP provider and sublayer, with
 permit filters weighted above the block so exceptions win. `rustinel response
@@ -382,6 +415,16 @@ machine where a kernel-mode attacker wins.
 | `posture_credential_guard` | Makes an `lsass` read worthless even when the detection misses |
 | `posture_lsa_protection` | Makes `lsass` a protected process, so the handle open is refused by the kernel |
 | `posture_dma_protection` | A peripheral reading physical memory over DMA is invisible to any software agent |
+
+It also checks that the actions you have enabled can actually run, because an
+action that cannot is invisible until the moment it is needed:
+
+| Check | What it catches |
+| --- | --- |
+| `response_isolation_exceptions` | Isolation enabled with no exceptions, or with one that does not parse |
+| `response_filtering_engine` | The filtering engine unreachable, usually missing elevation or a stopped Base Filtering Engine service |
+| `response_quarantine_directory` | A quarantine directory that cannot be written |
+| `response_containment_active` | This host is already contained by a previous isolation |
 
 The doctor reads these; it never changes them. Turning on Credential Guard or
 memory integrity has reboot and driver-compatibility consequences that belong to

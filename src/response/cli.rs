@@ -122,11 +122,25 @@ fn isolate(config: &AppConfig, yes: bool) -> Result<i32> {
         return Ok(2);
     }
 
+    // An exception that did not parse is one the operator believes is in
+    // force. Saying so before isolating is the difference between a contained
+    // host and a stranded one.
+    let rejected = policy.rejected_cidrs();
+    if !rejected.is_empty() {
+        eprintln!("Refusing to isolate: these exceptions are not addresses or networks:");
+        for entry in rejected {
+            eprintln!("  - {entry}");
+        }
+        eprintln!("Fix them under [response.actions.isolate_host].allow_cidrs and try again.");
+        return Ok(2);
+    }
+
     if !yes {
         println!("This will cut the host off the network, keeping only:");
-        for cidr in &policy.allow_cidrs {
-            println!("  - {cidr}");
+        for network in policy.parsed_networks() {
+            println!("  - {network}");
         }
+        println!("  - loopback (always)");
         if policy.allow_dns {
             println!("  - DNS");
         }

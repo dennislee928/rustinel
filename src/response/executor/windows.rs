@@ -11,6 +11,7 @@
 //! ordinary Win32 and COM surfaces, so what happens here is what a kernel
 //! driver would do anyway.
 
+use super::asep::AsepSnapshot;
 use super::{ActionExecutor, Capabilities};
 use crate::response::action::{
     ActionError, ActionKind, ActionReceipt, Enforcement, ResponseAction,
@@ -23,8 +24,9 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteKeyValueW, RegDeleteTreeW, RegOpenKeyExW, HKEY, HKEY_CLASSES_ROOT,
-    HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_SET_VALUE,
+    RegCloseKey, RegDeleteKeyValueW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW, HKEY,
+    HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS,
+    KEY_SET_VALUE, REG_VALUE_TYPE,
 };
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
@@ -63,6 +65,7 @@ const PROTECTED_KEY_FRAGMENTS: &[&str] = &[r"\services\rustinel", r"\rustinel"];
 #[derive(Debug)]
 pub struct WindowsExecutor {
     capabilities: Capabilities,
+    snapshot: AsepSnapshot,
 }
 
 impl Default for WindowsExecutor {
@@ -72,13 +75,23 @@ impl Default for WindowsExecutor {
 }
 
 impl WindowsExecutor {
-    /// Build the executor.
+    /// Build the executor, reading the auto-start keys as they are now.
+    ///
+    /// The snapshot is what makes restoring a modified value possible at all:
+    /// a registry event says what was written, never what was there before, so
+    /// the only way to have the previous value is to have read it earlier.
     pub fn new() -> Self {
+        Self::with_snapshot(AsepSnapshot::capture())
+    }
+
+    /// Build with a specific snapshot, for tests.
+    pub fn with_snapshot(snapshot: AsepSnapshot) -> Self {
         Self {
             capabilities: Capabilities::none("handled by another executor")
                 .supporting(ActionKind::RevertRegistry, Enforcement::PostHoc)
                 .supporting(ActionKind::DisableService, Enforcement::PostHoc)
                 .supporting(ActionKind::DisableScheduledTask, Enforcement::PostHoc),
+            snapshot,
         }
     }
 }
@@ -102,7 +115,7 @@ impl ActionExecutor for WindowsExecutor {
 
         match action {
             ResponseAction::RevertRegistry { key, value } => {
-                let detail = revert_registry(key, value.as_deref())
+                let detail = revert_registry(key, value.as_deref(), &self.snapshot)
                     .map_err(|reason| ActionError::Failed { kind, reason })?;
                 Ok(receipt(detail))
             }
@@ -124,13 +137,30 @@ impl ActionExecutor for WindowsExecutor {
     }
 }
 
-/// Delete a persistence value, or the whole key when the event named no value.
-fn revert_registry(key: &str, value: Option<&str>) -> Result<String, String> {
+/// Put a persistence write back the way it was.
+///
+/// A value the snapshot knows about existed before the attack, so it is
+/// restored rather than deleted: `Winlogon\Userinit` and a service's
+/// `ImagePath` are modified by an attacker, not created, and deleting one
+/// breaks the logon path instead of repairing it. Only a value with no
+/// recorded predecessor is deleted, because for that one deletion *is* the
+/// original state.
+fn revert_registry(
+    key: &str,
+    value: Option<&str>,
+    snapshot: &AsepSnapshot,
+) -> Result<String, String> {
     if is_protected_key(key) {
         return Err(format!("{key} is protected and will not be reverted"));
     }
 
     let (root, subkey) = split_root(key)?;
+
+    if let Some(value) = value {
+        if let Some(previous) = snapshot.value(key, value) {
+            return restore_value(root, subkey, value, previous);
+        }
+    }
 
     match value {
         Some(value) => {
@@ -163,6 +193,38 @@ fn revert_registry(key: &str, value: Option<&str>) -> Result<String, String> {
                 other => Err(format!("RegDeleteTree failed: {:#x}", other.0)),
             }
         }
+    }
+}
+
+/// Write a recorded value back over whatever replaced it.
+fn restore_value(
+    root: HKEY,
+    subkey: &str,
+    value: &str,
+    previous: &crate::response::executor::asep::SnapshotValue,
+) -> Result<String, String> {
+    let mut handle = HKEY::default();
+    let status = unsafe { RegOpenKeyExW(root, &wide(subkey), None, KEY_SET_VALUE, &mut handle) };
+    if WIN32_ERROR(status.0) != ERROR_SUCCESS {
+        return Err(format!("RegOpenKeyEx failed: {:#x}", status.0));
+    }
+
+    let written = unsafe {
+        RegSetValueExW(
+            handle,
+            &wide(value),
+            None,
+            REG_VALUE_TYPE(previous.kind),
+            Some(&previous.data),
+        )
+    };
+    unsafe {
+        let _ = RegCloseKey(handle);
+    }
+
+    match WIN32_ERROR(written.0) {
+        ERROR_SUCCESS => Ok(format!("restored {value} to its value at agent start")),
+        other => Err(format!("RegSetValueEx failed: {:#x}", other.0)),
     }
 }
 
@@ -369,6 +431,7 @@ mod tests {
         let error = revert_registry(
             r"HKLM\SYSTEM\CurrentControlSet\Services\Rustinel",
             Some("ImagePath"),
+            &AsepSnapshot::empty(),
         )
         .expect_err("must refuse");
         assert!(error.contains("protected"), "unexpected error: {error}");
@@ -379,6 +442,51 @@ mod tests {
         for name in ["Rustinel", "rustinel", "BFE", "EventLog"] {
             let error = disable_service(name).expect_err("must refuse");
             assert!(error.contains("protected"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn a_value_the_snapshot_knows_is_restored_rather_than_deleted() {
+        // Winlogon's Userinit is modified by an attacker, never created.
+        // Deleting it would break the logon path instead of repairing it, so
+        // the revert has to write the recorded value back.
+        let key = r"HKCU\Software\ResponseExecutorRestoreTest";
+        let mut snapshot = AsepSnapshot::empty();
+        snapshot.insert(
+            key,
+            "Userinit",
+            crate::response::executor::asep::SnapshotValue {
+                kind: 1,
+                data: Vec::new(),
+            },
+        );
+
+        // The key does not exist, so the restore fails at the open rather than
+        // succeeding; what matters is *which* path it took. A delete would
+        // report RegDeleteKeyValue, a restore reports the open it needs first.
+        let error = revert_registry(key, Some("Userinit"), &snapshot).expect_err("no such key");
+        assert!(
+            error.contains("RegOpenKeyEx"),
+            "a known value must take the restore path, not the delete path: {error}"
+        );
+    }
+
+    #[test]
+    fn a_value_with_no_recorded_predecessor_is_deleted() {
+        // Nothing recorded means the value did not exist before the attack,
+        // and for that one deletion is the original state.
+        let result = revert_registry(
+            r"HKCU\Software\ResponseExecutorAbsentKey",
+            Some("Created"),
+            &AsepSnapshot::empty(),
+        );
+
+        match result {
+            Ok(detail) => assert!(detail.contains("absent"), "{detail}"),
+            Err(error) => assert!(
+                error.contains("RegDeleteKeyValue"),
+                "an unknown value must take the delete path: {error}"
+            ),
         }
     }
 
@@ -406,6 +514,7 @@ mod tests {
         let result = revert_registry(
             r"HKCU\Software\ResponseExecutorAbsentKey",
             Some("NoSuchValue"),
+            &AsepSnapshot::empty(),
         );
         match result {
             Ok(detail) => assert!(detail.contains("already absent"), "{detail}"),

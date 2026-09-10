@@ -27,6 +27,7 @@ use super::{ActionExecutor, Capabilities};
 use crate::response::action::{
     ActionError, ActionKind, ActionReceipt, Enforcement, ResponseAction,
 };
+use ipnetwork::IpNetwork;
 use std::net::IpAddr;
 
 /// Rustinel's WFP provider, so its filters can always be found and removed.
@@ -54,6 +55,11 @@ const WEIGHT_PERMIT: u64 = 0x2000;
 ///
 /// Empty means isolation is refused: an operator who has not said what to keep
 /// has not decided to isolate, they have decided to guess.
+///
+/// Loopback is not in here because it is not optional. A host that cannot talk
+/// to itself loses local inter-process communication over TCP, which breaks
+/// software that has nothing to do with the incident, so it is permitted
+/// unconditionally.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IsolationPolicy {
     /// Addresses and networks that stay reachable.
@@ -64,26 +70,67 @@ pub struct IsolationPolicy {
     pub allow_dhcp: bool,
 }
 
+/// Networks permitted through an isolation, always including loopback.
+///
+/// `127.0.0.0/8` and `::1/128` are appended to whatever the operator named.
+pub fn permitted_networks(policy: &IsolationPolicy) -> Vec<IpNetwork> {
+    let mut networks = policy.parsed_networks();
+
+    for loopback in ["127.0.0.0/8", "::1/128"] {
+        if let Ok(network) = loopback.parse::<IpNetwork>() {
+            networks.push(network);
+        }
+    }
+
+    networks
+}
+
 impl IsolationPolicy {
     /// Whether this policy names anything at all to keep working.
     pub fn is_empty(&self) -> bool {
         self.allow_cidrs.is_empty() && !self.allow_dns && !self.allow_dhcp
     }
 
-    /// Parsed exception addresses, discarding entries that are not addresses.
-    pub fn parsed_cidrs(&self) -> Vec<IpAddr> {
+    /// Exception networks, with their prefix lengths.
+    ///
+    /// A bare address becomes a host route: `10.1.2.3` is `10.1.2.3/32`, which
+    /// is what an operator writing a single address means. Entries that are not
+    /// addresses or networks are dropped, and [`Self::rejected_cidrs`] names
+    /// them so the caller can say so rather than silently narrowing the
+    /// exception list.
+    pub fn parsed_networks(&self) -> Vec<IpNetwork> {
         self.allow_cidrs
             .iter()
-            .filter_map(|entry| {
-                // A bare address or the address half of a CIDR; the prefix
-                // length is applied by the caller building the condition.
-                entry
-                    .split('/')
-                    .next()
-                    .and_then(|addr| addr.trim().parse::<IpAddr>().ok())
-            })
+            .filter_map(|entry| parse_network(entry))
             .collect()
     }
+
+    /// Entries that could not be parsed as an address or network.
+    pub fn rejected_cidrs(&self) -> Vec<&str> {
+        self.allow_cidrs
+            .iter()
+            .filter(|entry| parse_network(entry).is_none())
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// Parse one exception entry.
+fn parse_network(entry: &str) -> Option<IpNetwork> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+
+    if let Ok(network) = entry.parse::<IpNetwork>() {
+        return Some(network);
+    }
+
+    // A bare address is a host route, which `IpNetwork` will build given the
+    // full prefix length for its family.
+    let address: IpAddr = entry.parse().ok()?;
+    let prefix = if address.is_ipv4() { 32 } else { 128 };
+    IpNetwork::new(address, prefix).ok()
 }
 
 /// Executor for the two network actions.
@@ -207,6 +254,7 @@ pub fn installed_filter_count() -> Result<usize, String> {
 #[cfg(windows)]
 mod platform {
     use super::{IsolationPolicy, PROVIDER_GUID, SUBLAYER_GUID, WEIGHT_BLOCK, WEIGHT_PERMIT};
+    use ipnetwork::IpNetwork;
     use std::path::Path;
     use windows::core::{GUID, PCWSTR, PWSTR};
     use windows::Win32::Foundation::HANDLE;
@@ -219,7 +267,8 @@ mod platform {
         FWPM_FILTER_FLAG_PERSISTENT, FWPM_PROVIDER0, FWPM_PROVIDER_FLAG_PERSISTENT, FWPM_SESSION0,
         FWPM_SUBLAYER0, FWPM_SUBLAYER_FLAG_PERSISTENT, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
         FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_UINT16, FWP_UINT32,
-        FWP_VALUE0, FWP_VALUE0_0,
+        FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0,
+        FWP_VALUE0_0,
     };
     use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
@@ -476,38 +525,16 @@ mod platform {
         }
 
         // Exceptions carry the higher weight, so they win inside this sublayer.
-        for address in policy.parsed_cidrs() {
-            let std::net::IpAddr::V4(v4) = address else {
-                // An IPv6 exception needs a byte-array condition value; the
-                // management networks these are for are v4, and a v6 entry is
-                // skipped rather than silently widened.
-                continue;
-            };
-
-            let mut value = u32::from(v4);
-            let condition = FWPM_FILTER_CONDITION0 {
-                fieldKey: CONDITION_REMOTE_ADDRESS,
-                matchType: FWP_MATCH_EQUAL,
-                conditionValue: FWP_CONDITION_VALUE0 {
-                    r#type: FWP_UINT32,
-                    Anonymous: FWP_CONDITION_VALUE0_0 { uint32: value },
-                },
-            };
-            let _ = &mut value;
-
-            for layer in [LAYER_CONNECT_V4, LAYER_ACCEPT_V4] {
-                if add_filter(
-                    engine,
-                    layer,
-                    false,
-                    &mut permit_weight,
-                    std::slice::from_ref(&condition),
-                    persistent,
-                    &mut permit_name,
-                ) {
-                    installed += 1;
-                }
-            }
+        // Loopback is always among them: a host that cannot reach itself loses
+        // local IPC over TCP, which breaks software unrelated to the incident.
+        for network in super::permitted_networks(policy) {
+            installed += permit_network(
+                engine,
+                network,
+                persistent,
+                &mut permit_weight,
+                &mut permit_name,
+            );
         }
 
         if policy.allow_dhcp {
@@ -523,6 +550,91 @@ mod platform {
         }
         if policy.allow_dns {
             installed += permit_port(engine, 53, persistent, &mut permit_weight, &mut permit_name);
+        }
+
+        installed
+    }
+
+    /// Permit one network through the block, in both directions.
+    ///
+    /// The condition carries an address *and* a mask, which is the whole point:
+    /// matching on the address alone would turn `10.0.0.0/8` into a permit for
+    /// exactly one host and strand an operator who believed their management
+    /// range was reachable.
+    ///
+    /// The mask struct is a local because the condition value holds a pointer
+    /// to it; WFP copies the data during the add, so it only has to outlive
+    /// that call.
+    fn permit_network(
+        engine: &Engine,
+        network: IpNetwork,
+        persistent: bool,
+        weight: &mut u64,
+        name: &mut Wide,
+    ) -> usize {
+        let mut installed = 0;
+
+        match network {
+            IpNetwork::V4(v4) => {
+                let mut mask = FWP_V4_ADDR_AND_MASK {
+                    addr: u32::from(v4.network()),
+                    mask: u32::from(v4.mask()),
+                };
+                let condition = FWPM_FILTER_CONDITION0 {
+                    fieldKey: CONDITION_REMOTE_ADDRESS,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_V4_ADDR_MASK,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            v4AddrMask: &mut mask,
+                        },
+                    },
+                };
+
+                for layer in [LAYER_CONNECT_V4, LAYER_ACCEPT_V4] {
+                    if add_filter(
+                        engine,
+                        layer,
+                        false,
+                        weight,
+                        std::slice::from_ref(&condition),
+                        persistent,
+                        name,
+                    ) {
+                        installed += 1;
+                    }
+                }
+            }
+            IpNetwork::V6(v6) => {
+                let mut mask = FWP_V6_ADDR_AND_MASK {
+                    addr: v6.network().octets(),
+                    prefixLength: v6.prefix(),
+                };
+                let condition = FWPM_FILTER_CONDITION0 {
+                    fieldKey: CONDITION_REMOTE_ADDRESS,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_V6_ADDR_MASK,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            v6AddrMask: &mut mask,
+                        },
+                    },
+                };
+
+                for layer in [LAYER_CONNECT_V6, LAYER_ACCEPT_V6] {
+                    if add_filter(
+                        engine,
+                        layer,
+                        false,
+                        weight,
+                        std::slice::from_ref(&condition),
+                        persistent,
+                        name,
+                    ) {
+                        installed += 1;
+                    }
+                }
+            }
         }
 
         installed
@@ -821,22 +933,98 @@ mod tests {
     }
 
     #[test]
-    fn exception_addresses_are_parsed_and_bad_ones_dropped() {
+    fn a_prefix_length_widens_the_exception_to_the_whole_network() {
+        // The bug this guards against: matching on the address alone turns
+        // 10.0.0.0/8 into a permit for exactly one host, and an operator who
+        // believed their management range was reachable loses the machine.
+        let policy = IsolationPolicy {
+            allow_cidrs: vec!["10.0.0.0/8".to_string()],
+            ..IsolationPolicy::default()
+        };
+
+        let networks = policy.parsed_networks();
+        assert_eq!(networks.len(), 1);
+        assert_eq!(networks[0].prefix(), 8);
+        assert!(networks[0].contains("10.1.2.3".parse().expect("v4")));
+        assert!(!networks[0].contains("11.0.0.1".parse().expect("v4")));
+    }
+
+    #[test]
+    fn a_bare_address_becomes_a_host_route() {
+        let policy = IsolationPolicy {
+            allow_cidrs: vec!["10.1.2.3".to_string(), "fd00::1".to_string()],
+            ..IsolationPolicy::default()
+        };
+
+        let networks = policy.parsed_networks();
+        assert_eq!(networks.len(), 2);
+        assert_eq!(networks[0].prefix(), 32, "a v4 address is a /32");
+        assert_eq!(networks[1].prefix(), 128, "a v6 address is a /128");
+    }
+
+    #[test]
+    fn ipv6_exceptions_are_kept_rather_than_dropped() {
+        let policy = IsolationPolicy {
+            allow_cidrs: vec!["fd00::/8".to_string()],
+            ..IsolationPolicy::default()
+        };
+
+        let networks = policy.parsed_networks();
+        assert_eq!(networks.len(), 1);
+        assert!(networks[0].is_ipv6());
+    }
+
+    #[test]
+    fn unparseable_exceptions_are_reported_not_silently_dropped() {
         let policy = IsolationPolicy {
             allow_cidrs: vec![
-                "10.1.2.3".to_string(),
-                "192.168.0.0/16".to_string(),
+                "10.0.0.0/8".to_string(),
                 "not-an-address".to_string(),
-                "  172.16.0.1  ".to_string(),
+                "  192.168.1.1  ".to_string(),
             ],
             ..IsolationPolicy::default()
         };
 
-        let parsed = policy.parsed_cidrs();
-        assert_eq!(parsed.len(), 3, "one entry is not an address and must drop");
-        assert!(parsed.contains(&"10.1.2.3".parse().expect("v4")));
-        assert!(parsed.contains(&"192.168.0.0".parse().expect("v4")));
-        assert!(parsed.contains(&"172.16.0.1".parse().expect("v4")));
+        assert_eq!(policy.parsed_networks().len(), 2, "whitespace is trimmed");
+        assert_eq!(
+            policy.rejected_cidrs(),
+            vec!["not-an-address"],
+            "an operator must be told which exception did not take"
+        );
+    }
+
+    #[test]
+    fn loopback_is_permitted_whatever_the_policy_says() {
+        // A host that cannot reach itself loses local IPC over TCP, which
+        // breaks software with nothing to do with the incident.
+        let networks = permitted_networks(&IsolationPolicy::default());
+
+        assert!(
+            networks
+                .iter()
+                .any(|net| net.contains("127.0.0.1".parse().expect("v4"))),
+            "IPv4 loopback must survive isolation"
+        );
+        assert!(
+            networks
+                .iter()
+                .any(|net| net.contains("::1".parse().expect("v6"))),
+            "IPv6 loopback must survive isolation"
+        );
+    }
+
+    #[test]
+    fn loopback_is_added_on_top_of_the_operators_exceptions() {
+        let policy = IsolationPolicy {
+            allow_cidrs: vec!["10.0.0.0/8".to_string()],
+            ..IsolationPolicy::default()
+        };
+
+        let networks = permitted_networks(&policy);
+        assert_eq!(networks.len(), 3, "the operator's one, plus two loopbacks");
+        assert!(networks
+            .iter()
+            .any(|net| net.contains("10.1.2.3".parse().expect("v4"))));
     }
 
     #[test]

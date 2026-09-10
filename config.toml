@@ -128,7 +128,8 @@ enabled = false
 [response.actions.isolate_host]
 enabled = false
 persistent = true           # survive a reboot; fails closed
-allow_cidrs = []            # e.g. ["10.0.0.0/8"] for a management range
+allow_cidrs = []            # e.g. ["10.0.0.0/8"]; prefix lengths are honoured
+#                             loopback is always permitted, whatever this says
 allow_dns = true
 allow_dhcp = true
 
