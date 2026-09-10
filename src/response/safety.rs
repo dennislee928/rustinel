@@ -40,6 +40,8 @@ pub enum SuppressionReason {
     CriticalProcess,
     /// The target runs as a protected process; the handle would be refused.
     ProtectedProcessLight,
+    /// The alert named nothing for this action to act on.
+    MissingTarget,
 }
 
 impl SuppressionReason {
@@ -53,6 +55,7 @@ impl SuppressionReason {
             SuppressionReason::ProtectedImage => "protected_image",
             SuppressionReason::CriticalProcess => "critical_process",
             SuppressionReason::ProtectedProcessLight => "protected_process_light",
+            SuppressionReason::MissingTarget => "missing_target",
         }
     }
 

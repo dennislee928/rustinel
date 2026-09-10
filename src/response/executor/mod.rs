@@ -15,7 +15,12 @@
 //! is the seam a future signed driver would fill, and it reports every action
 //! as unsupported until that driver exists.
 
+pub mod quarantine;
 pub mod ring3;
+pub mod wfp;
+
+#[cfg(windows)]
+pub mod windows;
 
 #[cfg(windows)]
 pub mod driver;
@@ -143,9 +148,137 @@ pub trait ActionExecutor: Send + Sync + fmt::Debug {
     }
 }
 
-/// The executor to use on this platform.
-pub fn default_executor() -> Arc<dyn ActionExecutor> {
-    Arc::new(ring3::Ring3Executor::new())
+/// The executor to use on this platform, assembled from the specialised ones.
+///
+/// Built once, at engine construction: an executor owns operating-system
+/// handles and directories, which are install-time properties rather than
+/// things a hot reload should move underneath a running action.
+pub fn default_executor(config: &crate::config::ResponseConfig) -> Arc<dyn ActionExecutor> {
+    // The driver goes first: when one is loaded it denies the operation
+    // outright, and the user-mode executors below only clean up after it.
+    #[cfg(windows)]
+    let mut executors: Vec<Arc<dyn ActionExecutor>> = vec![
+        Arc::new(driver::KernelDriverExecutor::new()),
+        Arc::new(ring3::Ring3Executor::new()),
+    ];
+    #[cfg(not(windows))]
+    let mut executors: Vec<Arc<dyn ActionExecutor>> = vec![Arc::new(ring3::Ring3Executor::new())];
+
+    executors.push(Arc::new(quarantine::QuarantineExecutor::new(
+        config.quarantine_directory.clone(),
+        agent_owned_directories(),
+    )));
+
+    executors.push(Arc::new(wfp::WfpExecutor::new(
+        wfp::IsolationPolicy {
+            allow_cidrs: config.actions.isolate_host.allow_cidrs.clone(),
+            allow_dns: config.actions.isolate_host.allow_dns,
+            allow_dhcp: config.actions.isolate_host.allow_dhcp,
+        },
+        config.actions.isolate_host.persistent,
+    )));
+
+    #[cfg(windows)]
+    {
+        executors.push(Arc::new(windows::WindowsExecutor::new()));
+    }
+
+    Arc::new(CompositeExecutor::new(executors))
+}
+
+/// Directories holding the agent's own files, which no action may touch.
+///
+/// An engine that can quarantine its own binary or rules can be made to
+/// disarm itself by anyone who can steer a detection, so the list is compiled
+/// in rather than configured.
+fn agent_owned_directories() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+
+    let layout = crate::config::InstallLayout::managed_current();
+    dirs.push(layout.rules_dir.clone());
+    dirs.push(layout.logs_dir.clone());
+    if let Some(root) = layout.config_file.parent() {
+        dirs.push(root.to_path_buf());
+    }
+
+    dirs
+}
+
+/// Routes each action to the first executor that can perform it.
+///
+/// This is where a kernel driver would take precedence: when
+/// [`driver::KernelDriverExecutor`] reports a kind as `Inline`, placing it
+/// ahead of the user-mode executors is all it takes for that action to start
+/// denying the operation instead of cleaning up after it.
+#[derive(Debug)]
+pub struct CompositeExecutor {
+    executors: Vec<Arc<dyn ActionExecutor>>,
+    capabilities: Capabilities,
+}
+
+impl CompositeExecutor {
+    /// Compose executors in priority order.
+    pub fn new(executors: Vec<Arc<dyn ActionExecutor>>) -> Self {
+        let mut capabilities = Capabilities::none("no executor handles this action");
+
+        // First to claim a kind wins, so ordering is the priority.
+        for kind in ActionKind::ALL {
+            if let Some(support) = executors
+                .iter()
+                .map(|executor| executor.capabilities().support(kind))
+                .find(|support| support.is_supported())
+            {
+                capabilities = capabilities.with(kind, support);
+            }
+        }
+
+        Self {
+            executors,
+            capabilities,
+        }
+    }
+
+    /// The executor that would handle this kind.
+    fn executor_for(&self, kind: ActionKind) -> Option<&Arc<dyn ActionExecutor>> {
+        self.executors
+            .iter()
+            .find(|executor| executor.capabilities().supports(kind))
+    }
+}
+
+impl ActionExecutor for CompositeExecutor {
+    fn name(&self) -> &'static str {
+        "composite"
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    fn execute(&self, action: &ResponseAction) -> Result<ActionReceipt, ActionError> {
+        self.reject_unsupported(action)?;
+        self.executor_for(action.kind())
+            .ok_or(ActionError::Unsupported {
+                kind: action.kind(),
+                reason: "no executor handles this action",
+            })?
+            .execute(action)
+    }
+
+    fn rollback(&self, receipt: &ActionReceipt) -> Result<(), ActionError> {
+        self.executor_for(receipt.kind)
+            .ok_or(ActionError::Unsupported {
+                kind: receipt.kind,
+                reason: "no executor handles this action",
+            })?
+            .rollback(receipt)
+    }
 }
 
 /// An executor that records what it was asked to do and performs nothing.

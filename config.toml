@@ -94,6 +94,8 @@ channel_capacity = 128
 max_actions_per_minute = 30 # ceiling per action kind; 0 disables the ceiling
 cooldown_secs = 60          # minimum gap between identical actions on one target
 audit_to_alerts = true      # write every attempted action to the alert stream
+# Where quarantined files are kept. Relative paths resolve next to this file.
+quarantine_directory = "quarantine"
 
 # 4.1 Per-action switches. An action runs only when it is enabled here AND
 #     selected by a rule below. Termination is on by default because it is what
@@ -103,19 +105,32 @@ enabled = true
 [response.actions.suspend_process]
 enabled = false             # freeze for triage instead of killing
 
-# Not implemented yet: these parse and report as unsupported.
-[response.actions.isolate_host]
-enabled = false
-[response.actions.block_process_network]
-enabled = false
 [response.actions.quarantine_file]
-enabled = false
+enabled = false             # move a file out of reach, reversibly
+
+# Windows only. These undo persistence after it is written; a kernel driver
+# would refuse the write instead. See docs/active-response.md.
 [response.actions.revert_registry]
 enabled = false
 [response.actions.disable_service]
 enabled = false
 [response.actions.disable_scheduled_task]
 enabled = false
+
+# Windows only, and the only actions the kernel enforces: a WFP filter is
+# installed from user mode but evaluated in the kernel on every connection.
+[response.actions.block_process_network]
+enabled = false
+
+# Host isolation can strand a machine that is only reachable over the network
+# it just lost, so it refuses to run until something below says what must keep
+# working.
+[response.actions.isolate_host]
+enabled = false
+persistent = true           # survive a reboot; fails closed
+allow_cidrs = []            # e.g. ["10.0.0.0/8"] for a management range
+allow_dns = true
+allow_dhcp = true
 
 # 4.2 Policy rules, evaluated in order; the first match decides. Every field
 #     that is set must match, and an unset field matches everything. Leave the

@@ -388,6 +388,10 @@ pub struct ResponseConfig {
     /// Whether to write a record of every attempted action to the alert stream.
     #[serde(default = "default_true")]
     pub audit_to_alerts: bool,
+    /// Where quarantined files are kept. Relative paths resolve next to the
+    /// configuration file, as the log and rule directories do.
+    #[serde(default = "default_quarantine_directory")]
+    pub quarantine_directory: PathBuf,
     /// Per-action switches. An action must be enabled here *and* selected by a
     /// rule before it will run.
     #[serde(default)]
@@ -396,6 +400,10 @@ pub struct ResponseConfig {
     /// to keep the pre-policy behaviour described on `min_severity`.
     #[serde(default)]
     pub rules: Vec<ResponseRule>,
+}
+
+fn default_quarantine_directory() -> PathBuf {
+    PathBuf::from("quarantine")
 }
 
 fn default_max_actions_per_minute() -> u32 {
@@ -423,6 +431,7 @@ impl Default for ResponseConfig {
             max_actions_per_minute: default_max_actions_per_minute(),
             cooldown_secs: default_cooldown_secs(),
             audit_to_alerts: true,
+            quarantine_directory: default_quarantine_directory(),
             actions: ResponseActionsConfig::default(),
             rules: Vec::new(),
         }
@@ -459,14 +468,14 @@ impl Default for ActionToggle {
 /// Everything else is opt-in: an action that can cut a host off the network or
 /// move a file out from under a running program should never turn itself on
 /// because a rule pack mentioned it.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ResponseActionsConfig {
     #[serde(default = "ActionToggle::on")]
     pub terminate_process: ActionToggle,
     #[serde(default = "ActionToggle::off")]
     pub suspend_process: ActionToggle,
-    #[serde(default = "ActionToggle::off")]
-    pub isolate_host: ActionToggle,
+    #[serde(default)]
+    pub isolate_host: IsolationConfig,
     #[serde(default = "ActionToggle::off")]
     pub block_process_network: ActionToggle,
     #[serde(default = "ActionToggle::off")]
@@ -484,12 +493,52 @@ impl Default for ResponseActionsConfig {
         Self {
             terminate_process: ActionToggle::on(),
             suspend_process: ActionToggle::off(),
-            isolate_host: ActionToggle::off(),
+            isolate_host: IsolationConfig::default(),
             block_process_network: ActionToggle::off(),
             quarantine_file: ActionToggle::off(),
             revert_registry: ActionToggle::off(),
             disable_service: ActionToggle::off(),
             disable_scheduled_task: ActionToggle::off(),
+        }
+    }
+}
+
+/// Host isolation, and what must keep working while a host is isolated.
+///
+/// The exception list is not a convenience. Isolation refuses to run while it
+/// is empty, because cutting off a machine that is only reachable over the
+/// network it just lost is an outage the agent cannot undo remotely.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IsolationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether the filters survive a reboot.
+    ///
+    /// Persistent filters fail closed: a host stays isolated even if the agent
+    /// never starts again. That is the safe direction for containment and the
+    /// dangerous one for reachability.
+    #[serde(default = "default_true")]
+    pub persistent: bool,
+    /// Addresses and networks that stay reachable, such as the management
+    /// range an analyst would connect from.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    /// Keep name resolution working.
+    #[serde(default = "default_true")]
+    pub allow_dns: bool,
+    /// Keep DHCP working, so the lease can still be renewed.
+    #[serde(default = "default_true")]
+    pub allow_dhcp: bool,
+}
+
+impl Default for IsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            persistent: true,
+            allow_cidrs: Vec::new(),
+            allow_dns: true,
+            allow_dhcp: true,
         }
     }
 }
@@ -694,11 +743,19 @@ impl AppConfig {
             .set_default("response.max_actions_per_minute", 30i64)?
             .set_default("response.cooldown_secs", 60i64)?
             .set_default("response.audit_to_alerts", true)?
+            .set_default("response.quarantine_directory", "quarantine")?
             // Per-action switches. Termination stays on because it is the
             // behaviour that predates policy rules; the rest are opt-in.
             .set_default("response.actions.terminate_process.enabled", true)?
             .set_default("response.actions.suspend_process.enabled", false)?
             .set_default("response.actions.isolate_host.enabled", false)?
+            .set_default("response.actions.isolate_host.persistent", true)?
+            .set_default(
+                "response.actions.isolate_host.allow_cidrs",
+                Vec::<String>::new(),
+            )?
+            .set_default("response.actions.isolate_host.allow_dns", true)?
+            .set_default("response.actions.isolate_host.allow_dhcp", true)?
             .set_default("response.actions.block_process_network.enabled", false)?
             .set_default("response.actions.quarantine_file.enabled", false)?
             .set_default("response.actions.revert_registry.enabled", false)?
@@ -770,6 +827,12 @@ impl AppConfig {
             &mut self.logging.directory,
             base_dir,
             "LOGGING__DIRECTORY",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.response.quarantine_directory,
+            base_dir,
+            "RESPONSE__QUARANTINE_DIRECTORY",
             environment,
         );
         resolve_path_from_config(

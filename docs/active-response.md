@@ -19,23 +19,31 @@ kill a credential dumper a few milliseconds into its run, and not enough to stop
 the handle being opened in the first place.
 
 Denying an operation outright requires a kernel driver, which Rustinel does not
-ship. Windows exposes four supported ways to deny, all of them kernel-only:
+ship. Windows exposes four supported ways to deny, three of them kernel-only:
 
-| To deny | Kernel API | Rustinel's user-mode equivalent |
+| To deny | Kernel API | What Rustinel does instead |
 | --- | --- | --- |
-| A handle to another process | `ObRegisterCallbacks` pre-operation | Terminate or suspend the requester afterwards |
-| A registry write | `CmRegisterCallbackEx` pre-operation | Revert the value afterwards (not implemented yet) |
-| A file write | Minifilter `FltRegisterFilter` pre-operation | Quarantine the file afterwards (not implemented yet) |
-| A packet | WFP callout `FwpsCalloutRegister` | Block the connection with a WFP filter (not implemented yet) |
+| A handle to another process | `ObRegisterCallbacks` pre-operation | Terminates or suspends the requester afterwards |
+| A registry write | `CmRegisterCallbackEx` pre-operation | Deletes the value afterwards |
+| A file write | Minifilter `FltRegisterFilter` pre-operation | Quarantines the file afterwards |
+| A packet | WFP callout `FwpsCalloutRegister` | Installs a WFP filter, which the kernel *does* enforce |
+
+The last row is different in kind from the others. A WFP filter blocks by
+address, port, and application; it is installed from user mode and evaluated in
+the kernel on every later connection, so nothing about it is after the fact. A
+callout is only needed to inspect payload bytes, which Rustinel does not do.
+
+For the other three the difference is a race rather than a capability. A Run key
+write deleted a few milliseconds after it lands did exist for those
+milliseconds, and survives if the machine reboots inside that window.
 
 Loading a driver on 64-bit Windows needs a signature chaining to a Microsoft
 cross-signing certificate, which is an organisational prerequisite rather than a
-coding one. Until that exists, the engine reports honestly: every action carries
-an *enforcement* of `post_hoc`, and the audit record says so.
-
-The seam is already in place. An executor declares, per action, whether it can
-act and how strongly; `KernelDriverExecutor` documents the contract a driver
-would fill and reports every action unsupported today.
+coding one. The driver source is in `driver/`, and `KernelDriverExecutor` probes
+for it at startup: with a driver loaded it takes precedence over the user-mode
+executors, and without one it reports every action unsupported and they do the
+work. Every action's audit record carries the *enforcement* that actually
+applied, so which of the two happened is never a guess.
 
 ## Modes
 
@@ -49,20 +57,73 @@ the policy is live. It can only tighten: no rule can switch prevention on.
 
 ## Actions
 
-| Action | What it does | Platforms | Enabled by default |
-| --- | --- | --- | --- |
-| `terminate_process` | Kills the process | Windows, Linux, macOS | Yes |
-| `suspend_process` | Freezes every thread, leaving the process for triage | Windows, Linux, macOS | No |
-| `isolate_host` | Cuts the host off the network except an allowlist | not implemented | No |
-| `block_process_network` | Denies one image network access | not implemented | No |
-| `quarantine_file` | Moves a file out of reach, reversibly | not implemented | No |
-| `revert_registry` | Undoes a persistence write | not implemented | No |
-| `disable_service` | Stops and disables a service | not implemented | No |
-| `disable_scheduled_task` | Disables a scheduled task | not implemented | No |
+| Action | What it does | Platforms | Enforcement | Enabled by default |
+| --- | --- | --- | --- | --- |
+| `terminate_process` | Kills the process | Windows, Linux, macOS | post-hoc | Yes |
+| `suspend_process` | Freezes every thread, leaving the process for triage | Windows, Linux, macOS | post-hoc | No |
+| `isolate_host` | Cuts the host off the network except an allowlist | Windows | **inline** | No |
+| `block_process_network` | Denies one image network access | Windows | **inline** | No |
+| `quarantine_file` | Moves a file out of reach, reversibly | Windows, Linux, macOS | post-hoc | No |
+| `revert_registry` | Deletes a persistence value or key | Windows | post-hoc | No |
+| `disable_service` | Stops a service and marks it disabled | Windows | post-hoc | No |
+| `disable_scheduled_task` | Disables a scheduled task | Windows | post-hoc | No |
 
-The unimplemented actions parse and are reported as unsupported rather than
-silently ignored, so a policy naming one is visible in the audit stream instead
-of quietly doing nothing.
+The two network actions are the only ones marked inline, and the distinction is
+real rather than cosmetic. A WFP filter is installed from user mode but
+evaluated by the kernel on every later connection, so the packet never leaves.
+Everything else happens after the operation it responds to.
+
+An action that cannot run on this platform, or whose subject the alert does not
+name, is reported as unsupported rather than silently ignored, so a policy
+naming one is visible in the audit stream instead of quietly doing nothing.
+
+### What each action needs from the alert
+
+Most actions act on something other than the process, and only an alert that
+named that subject can drive them.
+
+| Action | Subject | Comes from |
+| --- | --- | --- |
+| `terminate_process`, `suspend_process`, `block_process_network` | The process | Any alert carrying a process |
+| `quarantine_file` | A file | A file event's target, a service image, or the process image on a YARA hit |
+| `revert_registry` | A key, and a value where the event named one | A registry event |
+| `disable_service` | A service name | A service creation event (7045) |
+| `disable_scheduled_task` | A task path | A task registration event |
+| `isolate_host` | Nothing; it acts on the host | Any alert |
+
+An action whose subject is absent is suppressed with `missing_target`, not
+applied to a substitute.
+
+### Quarantine
+
+A file is moved into `response.quarantine_directory` under its SHA-256, stored
+with its bytes obfuscated, and accompanied by a metadata document naming where
+it came from. Restoring reproduces the original exactly.
+
+The obfuscation is a single-byte XOR. It is not encryption and is not claimed to
+be: it exists so the quarantine directory does not read as a malware collection
+to the next scanner that walks it, and so a stored file cannot be run by
+double-clicking it.
+
+Nothing under the agent's own install and data directories is ever quarantined.
+A response engine that can be steered into quarantining its own binary is one an
+attacker can disarm through a detection.
+
+### Isolation
+
+Isolation refuses to run unless `[response.actions.isolate_host]` names at least
+one exception. Cutting off a machine reachable only over the network it just
+lost is an outage the agent cannot undo remotely, so the empty case is treated
+as an operator who has not decided rather than one who wants everything blocked.
+
+Filters are installed under Rustinel's own WFP provider and sublayer, with
+permit filters weighted above the block so exceptions win. `rustinel response
+unisolate` enumerates by provider rather than trusting a stored list, so
+isolation can be lifted after a reboot, a crash, or a lost state file.
+
+With `persistent = true`, the default, filters survive a reboot. That fails
+closed: a host stays isolated even if the agent never starts again, which is the
+safe direction for containment and the dangerous one for reachability.
 
 On Windows, `terminate_process` is `OpenProcess` plus `TerminateProcess`, and
 `suspend_process` is `NtSuspendProcess`. `DebugActiveProcess` would also freeze a
@@ -302,6 +363,29 @@ whoami
 
 Use the YARA demo above, or another long-running executable outside the trusted
 path allowlist, when validating dry-run or termination behavior.
+
+## Platform posture
+
+Some of what protects a machine is not something the agent can do. An attacker
+in kernel mode is past Rustinel entirely: they can patch the structures its
+telemetry comes from, or read `lsass` memory it is watching. What stops that is
+the platform's own virtualization-based protection.
+
+`rustinel doctor` reports on five of them, as warnings rather than failures,
+because a machine without them is not misconfigured for Rustinel; it is a
+machine where a kernel-mode attacker wins.
+
+| Check | Why it matters to response |
+| --- | --- |
+| `posture_vbs` | Without VBS the kernel has no isolated world to protect itself with |
+| `posture_hvci` | Memory integrity is what stops an unsigned or vulnerable driver reaching kernel mode |
+| `posture_credential_guard` | Makes an `lsass` read worthless even when the detection misses |
+| `posture_lsa_protection` | Makes `lsass` a protected process, so the handle open is refused by the kernel |
+| `posture_dma_protection` | A peripheral reading physical memory over DMA is invisible to any software agent |
+
+The doctor reads these; it never changes them. Turning on Credential Guard or
+memory integrity has reboot and driver-compatibility consequences that belong to
+whoever owns the machine.
 
 ## Replay never responds
 

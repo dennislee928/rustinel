@@ -21,15 +21,16 @@ pub(crate) mod tests_support;
 use crate::alerts::AlertSink;
 use crate::config::ResponseConfig;
 use crate::models::{Alert, AlertSeverity, DetectionEngine, EventFields};
-use crate::response::action::{ActionKind, ResponseAction};
+use crate::response::action::{ActionKind, ActionTargets};
 use crate::response::audit::{ActionOutcome, ResponseAuditRecord};
 use crate::response::executor::ActionExecutor;
 use crate::response::policy::PreparedPolicy;
-use crate::response::safety::SafetyGate;
+use crate::response::safety::{SafetyGate, SuppressionReason};
 use crate::utils::{
     hash_command_line, normalize_path_for_comparison, validate_process_identity, ProcessIdentity,
 };
 use arc_swap::ArcSwap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -58,7 +59,8 @@ struct ResponseTask {
     rule_dry_run: bool,
     pid: Option<u32>,
     image: Option<String>,
-    identity: Option<ProcessIdentity>,
+    /// Everything the alert named for an action to act on.
+    targets: ActionTargets,
 }
 
 #[derive(Clone)]
@@ -148,7 +150,8 @@ impl ResponseDecision {
 
 impl ResponseEngine {
     pub fn new(cfg: Arc<ArcSwap<ResponseConfig>>) -> (Self, tokio::task::JoinHandle<()>) {
-        Self::with_options(cfg, executor::default_executor(), None)
+        let executor = executor::default_executor(&cfg.load());
+        Self::with_options(cfg, executor, None)
     }
 
     /// Build an engine that acts through a specific executor.
@@ -253,7 +256,7 @@ impl ResponseEngine {
             rule_dry_run,
             pid,
             image,
-            identity: extract_process_identity(alert),
+            targets: extract_action_targets(alert),
         };
 
         if let Err(err) =
@@ -337,12 +340,18 @@ fn decide_response(
     };
 
     // An action must be selected by the rule, switched on in configuration,
-    // and something the executor can actually do.
+    // something the executor can do, and aimed at something this alert
+    // actually named.
+    let targets = extract_action_targets(alert);
     let actions: Vec<ActionKind> = rule
         .actions
         .iter()
         .copied()
-        .filter(|kind| policy.action_enabled(*kind) && executor.capabilities().supports(*kind))
+        .filter(|kind| {
+            policy.action_enabled(*kind)
+                && executor.capabilities().supports(*kind)
+                && targets.has_target_for(*kind)
+        })
         .collect();
 
     if actions.is_empty() {
@@ -443,12 +452,16 @@ fn handle_task(
 
     // One identity check covers every action in the set: if the PID was
     // recycled, nothing in the set is safe to run against it.
-    let expected_identity = task.identity.clone().unwrap_or_else(|| ProcessIdentity {
-        pid: target.pid,
-        image: target.image.clone(),
-        start_time: None,
-        command_line_hash: None,
-    });
+    let expected_identity = task
+        .targets
+        .process
+        .clone()
+        .unwrap_or_else(|| ProcessIdentity {
+            pid: target.pid,
+            image: target.image.clone(),
+            start_time: None,
+            command_line_hash: None,
+        });
 
     let current_identity = match validate_process_identity(&expected_identity) {
         Ok(identity) => identity,
@@ -473,10 +486,24 @@ fn handle_task(
     // A rule dry run tightens; it cannot loosen a global dry run.
     let dry_run = !policy.prevention_enabled || task.rule_dry_run;
 
+    // Act on the revalidated identity, not the one the alert carried.
+    let targets = ActionTargets {
+        process: Some(current_identity.clone()),
+        ..task.targets.clone()
+    };
+
     for kind in ordered_actions(&task.actions) {
-        let action = match build_action(kind, &current_identity) {
-            Some(action) => action,
-            None => continue,
+        let Some(action) = targets.build(kind) else {
+            // The subject went missing between decision and execution.
+            log_outcome(
+                &task,
+                &target,
+                kind,
+                &ActionOutcome::Suppressed {
+                    reason: SuppressionReason::MissingTarget,
+                },
+            );
+            continue;
         };
 
         let now = Instant::now();
@@ -542,23 +569,6 @@ fn ordered_actions(actions: &[ActionKind]) -> Vec<ActionKind> {
         ActionKind::TerminateProcess => 7,
     });
     ordered
-}
-
-/// Build the action payload for one kind.
-///
-/// Only the process actions can be built from an alert alone; the rest need
-/// context the engine does not carry yet and are filtered out well before
-/// here by the executor capability check.
-fn build_action(kind: ActionKind, identity: &ProcessIdentity) -> Option<ResponseAction> {
-    match kind {
-        ActionKind::TerminateProcess => Some(ResponseAction::TerminateProcess {
-            target: identity.clone(),
-        }),
-        ActionKind::SuspendProcess => Some(ResponseAction::SuspendProcess {
-            target: identity.clone(),
-        }),
-        _ => None,
-    }
 }
 
 /// Log a task that never reached an action.
@@ -749,6 +759,69 @@ fn extract_process_info(alert: &Alert) -> (Option<u32>, Option<String>) {
     }
 
     (pid, image)
+}
+
+/// Gather everything the alert names for an action to act on.
+///
+/// The process comes from the same place response has always taken it. The
+/// rest are read from the event that fired, so an action only ever acts on
+/// something the detection actually saw.
+fn extract_action_targets(alert: &Alert) -> ActionTargets {
+    let mut targets = ActionTargets {
+        process: extract_process_identity(alert),
+        ..ActionTargets::default()
+    };
+
+    match &alert.event.fields {
+        EventFields::FileEvent(f) => {
+            targets.file = f
+                .target_filename
+                .as_deref()
+                .or(f.source_filename.as_deref())
+                .map(PathBuf::from);
+        }
+        EventFields::RegistryEvent(f) => {
+            if let Some(object) = f.target_object.as_deref() {
+                let (key, value) = split_registry_target(object);
+                targets.registry_key = Some(key);
+                targets.registry_value = value;
+            }
+        }
+        EventFields::ServiceCreation(f) => {
+            targets.service = f.service_name.clone();
+            targets.file = f.service_file_name.as_deref().map(PathBuf::from);
+        }
+        EventFields::TaskCreation(f) => {
+            targets.task = f.task_name.clone();
+        }
+        _ => {}
+    }
+
+    // A YARA hit on a file names the file in the rule description rather than
+    // in an event field, so the image is the only thing to quarantine.
+    if targets.file.is_none() && alert.engine == DetectionEngine::Yara {
+        if let Some(process) = &targets.process {
+            targets.file = Some(PathBuf::from(&process.image));
+        }
+    }
+
+    targets
+}
+
+/// Split a registry path into the key and, where present, the value name.
+///
+/// Sysmon writes a value write as `HKLM\\...\\Run\\Updater`, with the value
+/// name as the last segment and no way to tell it apart from a subkey. A
+/// `registry_set` event is a value write by definition, so the last segment is
+/// the value there and the whole path is the key otherwise.
+fn split_registry_target(object: &str) -> (String, Option<String>) {
+    let trimmed = object.trim_end_matches('\\');
+    match trimmed.rsplit_once('\\') {
+        Some((key, value)) if !key.is_empty() && !value.is_empty() => {
+            (key.to_string(), Some(value.to_string()))
+        }
+        _ => (trimmed.to_string(), None),
+    }
 }
 
 fn extract_process_identity(alert: &Alert) -> Option<ProcessIdentity> {

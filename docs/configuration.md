@@ -461,6 +461,7 @@ and timer-based delivery. Override the settings with
 | `max_actions_per_minute` | `30` | Ceiling per action kind; `0` disables the ceiling |
 | `cooldown_secs` | `60` | Minimum gap between identical actions on one target |
 | `audit_to_alerts` | `true` | Write every attempted action to the alert stream |
+| `quarantine_directory` | `quarantine` | Where quarantined files are kept; relative paths resolve next to the config file |
 
 #### Per-action switches
 
@@ -472,12 +473,22 @@ supported by the executor.
 | --- | --- | --- |
 | `terminate_process` | `true` | Implemented |
 | `suspend_process` | `false` | Implemented |
-| `isolate_host` | `false` | Not implemented; reported as unsupported |
-| `block_process_network` | `false` | Not implemented; reported as unsupported |
-| `quarantine_file` | `false` | Not implemented; reported as unsupported |
-| `revert_registry` | `false` | Not implemented; reported as unsupported |
-| `disable_service` | `false` | Not implemented; reported as unsupported |
-| `disable_scheduled_task` | `false` | Not implemented; reported as unsupported |
+| `isolate_host` | `false` | Windows only; enforced inline by the kernel |
+| `block_process_network` | `false` | Windows only; enforced inline by the kernel |
+| `quarantine_file` | `false` | All platforms |
+| `revert_registry` | `false` | Windows only |
+| `disable_service` | `false` | Windows only |
+| `disable_scheduled_task` | `false` | Windows only |
+
+`isolate_host` takes more than a switch, because it can strand a machine:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Whether isolation may run at all |
+| `persistent` | `true` | Whether the filters survive a reboot; `true` fails closed |
+| `allow_cidrs` | `[]` | Addresses that stay reachable; isolation refuses to run while this and both flags below are empty |
+| `allow_dns` | `true` | Keep name resolution working |
+| `allow_dhcp` | `true` | Keep the DHCP lease renewable |
 
 #### Policy rules
 

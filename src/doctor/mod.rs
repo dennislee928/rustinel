@@ -1,5 +1,6 @@
 pub mod inspect;
 pub mod path;
+pub mod posture;
 pub mod prerequisites;
 pub mod rules;
 pub mod services;

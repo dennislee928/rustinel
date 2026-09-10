@@ -1,60 +1,79 @@
-//! Seam for a future kernel-mode executor.
+//! Kernel-mode executor.
 //!
-//! Nothing here talks to a driver, because Rustinel does not ship one. The
-//! module exists so the boundary a driver would sit behind is written down and
-//! type-checked rather than imagined, and so the policy, safety, and audit
-//! layers need no change on the day one arrives.
-//!
-//! # What a driver would add
-//!
-//! User mode can only react: by the time an ETW event reaches Rustinel, the
-//! kernel has already opened the handle, written the value, or encrypted the
-//! file. Denial has to happen inside the operation, and Windows exposes
-//! exactly four supported ways to do that, none reachable from Ring 3:
+//! Everything else in this module tree acts after the operation it responds to.
+//! This is the seam for acting *instead of* it, which on Windows means a kernel
+//! driver, because the four APIs that can refuse an operation while it is
+//! happening are all kernel-mode callbacks:
 //!
 //! | Action | Kernel API | What it denies |
 //! | --- | --- | --- |
-//! | [`ActionKind::TerminateProcess`] | `ObRegisterCallbacks` pre-operation | Strips or denies `PROCESS_VM_WRITE`/`PROCESS_CREATE_THREAD` on handle open, so the injection never starts |
-//! | [`ActionKind::RevertRegistry`] | `CmRegisterCallbackEx` pre-operation | Returns `STATUS_ACCESS_DENIED` for the `RegSetValue`, so the Run key is never written |
-//! | [`ActionKind::QuarantineFile`] | Minifilter `FltRegisterFilter` pre-operation | Completes the IRP with `STATUS_ACCESS_DENIED`, so the ransomware write never lands |
-//! | [`ActionKind::BlockProcessNetwork`] | WFP callout `FwpsCalloutRegister` | Drops the packet rather than the connection |
+//! | [`ActionKind::TerminateProcess`] | `ObRegisterCallbacks` pre-operation | Strips `PROCESS_VM_READ`/`VM_WRITE`/`CREATE_THREAD` on handle open, so the dump or the injection never starts |
+//! | [`ActionKind::RevertRegistry`] | `CmRegisterCallbackEx` pre-operation | Fails the `RegSetValue`, so the Run key is never written |
+//! | [`ActionKind::QuarantineFile`] | Minifilter pre-operation | Completes the IRP with `STATUS_ACCESS_DENIED`, so the ransomware write never lands |
+//! | [`ActionKind::BlockProcessNetwork`] | WFP callout | Drops the packet after inspecting its payload |
 //!
-//! A driver would also unlock `Microsoft-Windows-Threat-Intelligence`, the
-//! only source of cross-process memory-write and APC-injection telemetry,
-//! which additionally requires the agent to run as a Protected Process Light
-//! under an ELAM driver signed through the Microsoft Virus Initiative.
+//! The driver source is in `driver/` and its interface is
+//! `driver/include/rustinel_ioctl.h`. This module mirrors that header; the two
+//! must agree exactly, because a struct that disagrees across the boundary is a
+//! kernel memory-corruption bug rather than a parse error.
 //!
-//! # Why it is not implemented
+//! # What this does when no driver is loaded
 //!
-//! Loading a kernel driver on 64-bit Windows requires an Authenticode
-//! signature chaining to a Microsoft cross-signing certificate, obtained
-//! through attestation or WHQL signing with an EV certificate. That is an
-//! organisational prerequisite, not a coding one. Until it is met, this
-//! executor reports every action as unsupported and
-//! [`super::ring3::Ring3Executor`] does the work after the fact.
+//! Reports every action unsupported, which is what makes the rest of the engine
+//! fall through to the user-mode executors. Nothing here fails loudly on a
+//! machine without the driver, because that is the normal case: the driver is
+//! optional and most deployments will not have one.
 //!
-//! # Contract for the implementation
+//! # Why most deployments will not have one
 //!
-//! The driver would expose a single control device, and `execute` would
-//! marshal the [`ResponseAction`] into one IOCTL per action kind, with the
-//! driver holding the policy state (protected PIDs, allowlisted images) that
-//! the pre-operation callbacks consult on the calling thread. `execute` must
-//! stay non-blocking: pre-operation callbacks run at `PASSIVE_LEVEL` in the
-//! context of the requesting thread, so a slow round trip stalls the very
-//! process being evaluated.
+//! A driver loads on 64-bit Windows only with a signature chaining to a
+//! Microsoft cross-signing certificate, obtained through attestation signing or
+//! WHQL with an EV certificate. `ObRegisterCallbacks` additionally refuses to
+//! register for an image not linked with `/INTEGRITYCHECK`. Neither is a coding
+//! problem, which is why the seam exists and the driver does not ship.
+//!
+//! Note that the network action is listed above for completeness only. WFP
+//! *filters*, which block by address, port, and application, are installed from
+//! user mode by [`super::wfp`] and are already enforced by the kernel; a callout
+//! adds payload inspection, which Rustinel does not do.
 
 use super::{ActionExecutor, Capabilities};
-use crate::response::action::{ActionError, ActionReceipt, ResponseAction};
+use crate::response::action::{
+    ActionError, ActionKind, ActionReceipt, Enforcement, ResponseAction,
+};
 
 /// Reason reported for every action while no driver is present.
 const NO_DRIVER: &str = "kernel driver is not installed";
 
-/// Executor that would delegate to a Rustinel kernel driver.
+/// Device the driver exposes, mirroring `RUSTINEL_USER_PATH`.
+pub const DEVICE_PATH: &str = r"\\.\Rustinel";
+
+/// Policy structure version, mirroring `RUSTINEL_POLICY_VERSION`.
+pub const POLICY_VERSION: u32 = 1;
+
+/// What the driver should do when a rule matches.
 ///
-/// Construct it to ask what a driver would provide; it never acts.
+/// Mirrors `RUSTINEL_DISPOSITION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Report only; the operation proceeds untouched.
+    Audit = 0,
+    /// Remove the dangerous rights and let the open succeed.
+    ///
+    /// Preferred over outright denial for process handles: a caller refused
+    /// entirely knows it was blocked, whereas one handed a handle without
+    /// `PROCESS_VM_READ` sees something indistinguishable from an ordinary
+    /// permissions problem.
+    Strip = 1,
+    /// Fail the operation.
+    Deny = 2,
+}
+
+/// Executor that would delegate to the Rustinel kernel driver.
 #[derive(Debug)]
 pub struct KernelDriverExecutor {
     capabilities: Capabilities,
+    device_present: bool,
 }
 
 impl Default for KernelDriverExecutor {
@@ -64,20 +83,33 @@ impl Default for KernelDriverExecutor {
 }
 
 impl KernelDriverExecutor {
-    /// Build the executor. Always reports every action unsupported, because
-    /// there is no driver to delegate to.
+    /// Build the executor, probing for the driver.
+    ///
+    /// The probe is a device open, which is the only reliable answer: a service
+    /// entry can exist for a driver that failed to register its callbacks, and
+    /// a driver that registered nothing should not be treated as present.
     pub fn new() -> Self {
+        let device_present = platform::device_present();
+
+        // Until a driver is actually loaded, claiming any capability would
+        // route actions here and strand them.
+        let capabilities = if device_present {
+            Capabilities::none("not implemented by the driver yet")
+                .supporting(ActionKind::TerminateProcess, Enforcement::Inline)
+                .supporting(ActionKind::RevertRegistry, Enforcement::Inline)
+        } else {
+            Capabilities::none(NO_DRIVER)
+        };
+
         Self {
-            capabilities: Capabilities::none(NO_DRIVER),
+            capabilities,
+            device_present,
         }
     }
 
     /// Whether a Rustinel kernel driver is loaded.
-    ///
-    /// Always `false`. Kept as a named predicate so the call sites that will
-    /// need it read correctly today.
     pub fn driver_present(&self) -> bool {
-        false
+        self.device_present
     }
 }
 
@@ -91,22 +123,74 @@ impl ActionExecutor for KernelDriverExecutor {
     }
 
     fn execute(&self, action: &ResponseAction) -> Result<ActionReceipt, ActionError> {
+        let enforcement = self.reject_unsupported(action)?;
+
+        // Reached only when a driver is present and claims this kind. The
+        // policy push itself is not implemented, so the action is reported
+        // rather than silently treated as done.
+        let _ = enforcement;
         Err(ActionError::Unsupported {
             kind: action.kind(),
-            reason: NO_DRIVER,
+            reason: "the driver policy interface is not implemented yet",
         })
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::DEVICE_PATH;
+
+    /// Whether the driver's control device can be opened.
+    pub(super) fn device_present() -> bool {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        let handle = unsafe {
+            CreateFileW(
+                &HSTRING::from(DEVICE_PATH),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+
+        match handle {
+            Ok(handle) => {
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    /// The driver is Windows-only.
+    pub(super) fn device_present() -> bool {
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::response::action::ActionKind;
     use crate::utils::ProcessIdentity;
 
     #[test]
-    fn driver_executor_supports_nothing_and_says_why() {
+    fn without_a_driver_every_action_is_unsupported() {
         let executor = KernelDriverExecutor::new();
+
+        // No driver ships, so this is the state on every machine that runs
+        // the test suite.
         assert!(!executor.driver_present());
         assert!(executor.capabilities().supported_kinds().is_empty());
 
@@ -126,5 +210,22 @@ mod tests {
                 reason: NO_DRIVER,
             })
         );
+    }
+
+    #[test]
+    fn the_device_path_matches_the_driver_header() {
+        // `RUSTINEL_USER_PATH` in driver/include/rustinel_ioctl.h. A mismatch
+        // means the agent probes a device the driver never created, and the
+        // driver silently never gets used.
+        assert_eq!(DEVICE_PATH, r"\\.\Rustinel");
+    }
+
+    #[test]
+    fn dispositions_match_the_driver_enum() {
+        // These are sent as integers over the IOCTL boundary, so the values
+        // matter more than the names.
+        assert_eq!(Disposition::Audit as u32, 0);
+        assert_eq!(Disposition::Strip as u32, 1);
+        assert_eq!(Disposition::Deny as u32, 2);
     }
 }

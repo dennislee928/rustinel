@@ -83,7 +83,7 @@ async fn run_macos_edr(
     let response_config = Arc::new(ArcSwap::from(Arc::new(cfg.response.clone())));
     let (response_engine, response_worker_handle) = ResponseEngine::with_options(
         response_config.clone(),
-        crate::response::executor::default_executor(),
+        crate::response::executor::default_executor(&response_config.load()),
         Some(alert_sink.clone()),
     );
 

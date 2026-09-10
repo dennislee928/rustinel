@@ -162,6 +162,66 @@ impl ResponseAction {
     }
 }
 
+/// Everything an alert offers for an action to act on, gathered once.
+///
+/// Most actions need something the alert names other than the process: a file
+/// to quarantine, a registry value to revert, a service to disable. An action
+/// whose subject the alert does not carry cannot run, and saying so is better
+/// than acting on a substitute.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActionTargets {
+    /// Process behind the alert. Present for nearly every event.
+    pub process: Option<ProcessIdentity>,
+    /// File the event touched.
+    pub file: Option<PathBuf>,
+    /// Registry key the event wrote.
+    pub registry_key: Option<String>,
+    /// Registry value name within that key, when the event named one.
+    pub registry_value: Option<String>,
+    /// Service the event created.
+    pub service: Option<String>,
+    /// Scheduled task the event registered.
+    pub task: Option<String>,
+}
+
+impl ActionTargets {
+    /// Build the action of this kind, or `None` when the alert names no
+    /// subject for it.
+    pub fn build(&self, kind: ActionKind) -> Option<ResponseAction> {
+        match kind {
+            ActionKind::TerminateProcess => Some(ResponseAction::TerminateProcess {
+                target: self.process.clone()?,
+            }),
+            ActionKind::SuspendProcess => Some(ResponseAction::SuspendProcess {
+                target: self.process.clone()?,
+            }),
+            // Isolation has no subject: it acts on the whole host.
+            ActionKind::IsolateHost => Some(ResponseAction::IsolateHost),
+            ActionKind::BlockProcessNetwork => Some(ResponseAction::BlockProcessNetwork {
+                image: PathBuf::from(&self.process.as_ref()?.image),
+            }),
+            ActionKind::QuarantineFile => Some(ResponseAction::QuarantineFile {
+                path: self.file.clone()?,
+            }),
+            ActionKind::RevertRegistry => Some(ResponseAction::RevertRegistry {
+                key: self.registry_key.clone()?,
+                value: self.registry_value.clone(),
+            }),
+            ActionKind::DisableService => Some(ResponseAction::DisableService {
+                name: self.service.clone()?,
+            }),
+            ActionKind::DisableScheduledTask => Some(ResponseAction::DisableScheduledTask {
+                path: self.task.clone()?,
+            }),
+        }
+    }
+
+    /// Whether this alert names a subject for the given action.
+    pub fn has_target_for(&self, kind: ActionKind) -> bool {
+        self.build(kind).is_some()
+    }
+}
+
 /// Whether an action stopped the operation before it happened, or cleaned up
 /// after it.
 ///
