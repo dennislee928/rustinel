@@ -54,6 +54,29 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// The platform this agent is running on.
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOS
+        }
+
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        {
+            Self::Windows
+        }
+    }
+
     /// The lowercase platform name, matching how it is serialized.
     pub fn as_str(self) -> &'static str {
         match self {

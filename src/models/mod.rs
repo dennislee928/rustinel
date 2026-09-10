@@ -47,6 +47,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event,
             match_details: None,
         };

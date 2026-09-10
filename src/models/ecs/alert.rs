@@ -96,6 +96,10 @@ pub struct EcsAlert {
     #[serde(rename = "rule.id", skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
 
+    /// Detection rule tags, as written in the rule (`attack.t1003.001`).
+    #[serde(rename = "rule.tags", skip_serializing_if = "Vec::is_empty")]
+    pub rule_tags: Vec<String>,
+
     /// Detection severity (critical, high, medium, low)
     #[serde(rename = "edr.rule.severity")]
     pub edr_rule_severity: String,

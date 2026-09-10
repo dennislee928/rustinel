@@ -64,6 +64,7 @@ Format:
 | `edr.event.provenance` | Sparse field-level fidelity markers. A field marked `derived` was reconstructed from process metadata rather than measured on the event itself. Absent when no fields were derived. |
 | `rule.name`         | Detection rule title                                                                                                                                                                                  |
 | `rule.id`           | Optional detection rule identifier, unique amongs the rustinel rules. Formatted as: `sigma::<uuid>` for Sigma, `yara::<id>` for YARA (if metadata ID is defined), or `ioc::<type>::<value>` for IOCs. |
+| `rule.tags`         | Sigma rule tags, as written in the rule (`attack.t1003.001`). Omitted when the rule declares none, and always absent for YARA and IOC alerts.                                          |
 | `edr.rule.severity` | Low, Medium, High, or Critical                                                                                                                                                                        |
 | `edr.rule.engine`   | `Sigma`, `Yara`, or `Ioc`                                                                                                                                                                             |
 | `edr.process.image_source` | Linux process image provenance: `proc` when resolved from `/proc/<pid>/exe`, or `execve` when the raw invocation string was used after that lookup lost the process lifetime race. |
@@ -119,6 +120,57 @@ Format:
   "edr.process.image_source": "proc",
   "process.name": "whoami",
   "user.name": "root"
+}
+```
+
+## Response Records
+
+When active response is enabled, every attempted action is written to the same
+alert file as an ECS document with `event.dataset: rustinel.response` and
+`event.kind: event`. Records are written for actions that did nothing as well as
+for actions that ran: a trail showing only successes cannot answer why something
+was not stopped. Set `response.audit_to_alerts = false` to keep them out of the
+alert file.
+
+| Field | Description |
+| --- | --- |
+| `event.action` | `rustinel.response.<action>`, e.g. `rustinel.response.terminate_process` |
+| `event.outcome` | `success`, `failure`, or `unknown` for a dry run or suppression |
+| `event.type` | `denied` when the action ran, `info` otherwise |
+| `edr.response.action` | Action kind, in its configuration spelling |
+| `edr.response.mode` | `prevention` or `dry_run`: what the engine was configured to do |
+| `edr.response.decision` | `performed`, `dry_run`, `suppressed`, or `failed` |
+| `edr.response.reason` | Suppression reason or operating system error; omitted on plain success |
+| `edr.response.executor` | Executor that handled it, currently always `ring3` |
+| `edr.response.enforcement` | `post_hoc` if it cleaned up after the operation, `inline` if it denied it |
+| `edr.response.target` | What the action acted on |
+| `edr.response.policy_rule` | Policy rule that selected the action |
+
+```json
+{
+  "@timestamp": "2026-09-10T09:12:44.118Z",
+  "ecs.version": "9.4.0",
+  "event.kind": "event",
+  "event.category": ["intrusion_detection"],
+  "event.type": ["denied"],
+  "event.action": "rustinel.response.terminate_process",
+  "event.outcome": "success",
+  "event.dataset": "rustinel.response",
+  "event.module": "edr",
+  "event.severity": 99,
+  "rule.name": "Suspicious LSASS Access",
+  "rule.id": "sigma::abc-123",
+  "edr.rule.severity": "Critical",
+  "edr.rule.engine": "Sigma",
+  "edr.response.action": "terminate_process",
+  "edr.response.mode": "prevention",
+  "edr.response.decision": "performed",
+  "edr.response.executor": "ring3",
+  "edr.response.enforcement": "post_hoc",
+  "edr.response.target": "4242:C:\\tmp\\evil.exe",
+  "edr.response.policy_rule": "credential-access",
+  "process.pid": 4242,
+  "process.executable": "C:\\tmp\\evil.exe"
 }
 ```
 

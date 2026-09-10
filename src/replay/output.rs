@@ -187,6 +187,7 @@ mod tests {
             rule_description: None,
             rule_id: Some("sigma::encoded-powershell".to_string()),
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-08-16T10:00:01Z".to_string(),
                 source_seq: None,

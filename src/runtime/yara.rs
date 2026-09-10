@@ -99,6 +99,7 @@ pub fn build_yara_alert(
         rule_description: None,
         rule_id,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: utils::now_timestamp_string(),
             source_seq: None,
@@ -184,6 +185,7 @@ pub fn build_yara_memory_alert(
         rule_description: None,
         rule_id,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: utils::now_timestamp_string(),
             source_seq: None,

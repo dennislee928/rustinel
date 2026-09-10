@@ -22,6 +22,7 @@ fn make_alert(rule: &str, image: &str) -> Alert {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-06-09T00:00:00Z".to_string(),
             source_seq: None,

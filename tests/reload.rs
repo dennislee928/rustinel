@@ -33,6 +33,7 @@ fn dummy_response_config() -> Arc<arc_swap::ArcSwap<ResponseConfig>> {
         channel_capacity: 4,
         allowlist_images: Vec::new(),
         allowlist_paths: Vec::new(),
+        ..ResponseConfig::default()
     })))
 }
 
@@ -687,6 +688,7 @@ fn build_critical_process_alert(pid: u32, image: &str) -> rustinel::models::Aler
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             source_seq: None,
@@ -809,7 +811,7 @@ min_severity = "critical"
     assert!(
         matches!(
             decision_after,
-            rustinel::response::ResponseDecision::Terminate { pid, .. } if pid == test_pid
+            rustinel::response::ResponseDecision::Execute { pid, .. } if pid == test_pid
         ),
         "expected Terminate, got: {:?}",
         decision_after,

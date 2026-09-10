@@ -9,9 +9,11 @@ mod event;
 mod helpers;
 mod network;
 mod registry;
+mod response;
 mod user;
 
 pub use alert::{DnsAnswer, EcsAlert, ReplayProvenance};
+pub use response::EcsResponse;
 
 use crate::models::{Alert, EventFields};
 use event::{
@@ -61,6 +63,7 @@ impl From<&Alert> for EcsAlert {
             rule_name: alert.rule_name.clone(),
             rule_description: alert.rule_description.clone(),
             rule_id: alert.rule_id.clone(),
+            rule_tags: alert.tags.clone(),
             edr_rule_severity: format!("{:?}", alert.severity),
             edr_rule_engine: format!("{:?}", alert.engine),
             process_executable: None,
@@ -431,6 +434,7 @@ mod tests {
             rule_description: None,
             rule_id: Some("sigma::test-rule-id".to_string()),
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -510,6 +514,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: Some(81234),
@@ -570,6 +575,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -639,6 +645,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -682,6 +689,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -774,6 +782,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -823,6 +832,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -864,6 +874,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-02-04T00:00:00Z".to_string(),
                 source_seq: None,

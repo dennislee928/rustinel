@@ -230,8 +230,13 @@ SIEM pipeline validation.
 
 It is not a drop-in replacement for a mature commercial EDR. It does not provide
 kernel-level self-protection, pre-execution blocking, anti-tamper guarantees, or
-managed response. A sufficiently privileged attacker may interfere with
+a managed response console. A sufficiently privileged attacker may interfere with
 user-mode telemetry.
+
+Rustinel can respond as well as detect: it terminates or suspends the process
+behind an alert, under operator-defined policy rules. Because it runs in user
+mode it always acts *after* the operation it responds to, never instead of it.
+See [Active Response](https://docs.rustinel.io/active-response/).
 
 Read the [current limitations](https://docs.rustinel.io/limitations/) when
 evaluating it for your environment.

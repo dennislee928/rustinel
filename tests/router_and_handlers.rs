@@ -43,6 +43,7 @@ async fn router_invokes_sigma_handler_and_writes_alert() {
             channel_capacity: 4,
             allowlist_images: Vec::new(),
             allowlist_paths: Vec::new(),
+            ..ResponseConfig::default()
         })),
     ));
 

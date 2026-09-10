@@ -64,7 +64,11 @@ async fn run_linux_edr(
 
     // 4. Active response engine
     let response_config = Arc::new(ArcSwap::from(Arc::new(cfg.response.clone())));
-    let (response_engine, response_worker_handle) = ResponseEngine::new(response_config.clone());
+    let (response_engine, response_worker_handle) = ResponseEngine::with_options(
+        response_config.clone(),
+        crate::response::executor::default_executor(),
+        Some(alert_sink.clone()),
+    );
 
     let pipeline = LivePipeline::new(
         &cfg,

@@ -69,18 +69,69 @@ window_secs = 60    # window length; repeats within this period are aggregated
 max_entries = 10000 # memory cap on distinct alert keys tracked simultaneously
 
 # 4. Active Response (Optional Prevention)
+#   Rustinel runs in user mode, so every action here happens after the operation
+#   that triggered it has already completed. Denying an operation outright needs
+#   a kernel driver, which Rustinel does not ship. See docs/active-response.md.
+#
+#   Start with prevention_enabled = false and read the audit records before
+#   turning it on.
 [response]
 enabled = false
-prevention_enabled = false
-min_severity = "critical"   # sigma: critical only; yara always treated as critical
+prevention_enabled = false  # false: select and record actions, perform none
+min_severity = "critical"   # only used when no [[response.rules]] are defined
 channel_capacity = 128
-# Processes that will never be terminated, matched by image basename or full path.
+# Processes that will never be acted on, matched by image basename or full path.
 # Complement the compiled-in path allowlist above for named system processes.
 #
 # Windows examples: smss.exe, csrss.exe, wininit.exe, lsass.exe, svchost.exe
 # Linux examples:  systemd, systemd-journald, sshd, dbus-daemon, auditd
 #
 # allowlist_images = []
+#
+# Additional never-act images, on top of the compiled-in list of processes whose
+# death takes the machine or the session with them.
+# protected_images = []
+max_actions_per_minute = 30 # ceiling per action kind; 0 disables the ceiling
+cooldown_secs = 60          # minimum gap between identical actions on one target
+audit_to_alerts = true      # write every attempted action to the alert stream
+
+# 4.1 Per-action switches. An action runs only when it is enabled here AND
+#     selected by a rule below. Termination is on by default because it is what
+#     the engine did before policy rules existed; everything else is opt-in.
+[response.actions.terminate_process]
+enabled = true
+[response.actions.suspend_process]
+enabled = false             # freeze for triage instead of killing
+
+# Not implemented yet: these parse and report as unsupported.
+[response.actions.isolate_host]
+enabled = false
+[response.actions.block_process_network]
+enabled = false
+[response.actions.quarantine_file]
+enabled = false
+[response.actions.revert_registry]
+enabled = false
+[response.actions.disable_service]
+enabled = false
+[response.actions.disable_scheduled_task]
+enabled = false
+
+# 4.2 Policy rules, evaluated in order; the first match decides. Every field
+#     that is set must match, and an unset field matches everything. Leave the
+#     whole list out to keep the pre-policy behaviour: terminate at or above
+#     min_severity.
+#
+# [[response.rules]]
+# name = "credential-access"
+# tags = ["attack.t1003*"]          # Sigma rule tags; * wildcards allowed
+# categories = ["process_access"]   # Sigma logsource category of the event
+# rule_ids = []                     # exact rule.id values (sigma::<uuid>)
+# rule_names = []                   # rule titles; * wildcards allowed
+# engines = ["sigma", "yara"]       # sigma, yara, ioc
+# min_severity = "high"
+# actions = ["suspend_process", "terminate_process"]
+# dry_run = false                   # can only tighten, never enable prevention
 
 # 5. Process Metadata Cache
 [process]

@@ -31,6 +31,7 @@ fn alert(category: EventCategory, event_id: u16, opcode: u8, fields: EventFields
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             source_seq: None,
@@ -456,6 +457,7 @@ fn macos_file_create_alert_maps_ecs_fields() {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: normalized,
         match_details: None,
     };
@@ -561,6 +563,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: Some("sigma::abc-123".to_string()),
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             source_seq: None,
@@ -606,6 +609,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
@@ -622,6 +626,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: Some("yara::yara-rule-uuid".to_string()),
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
@@ -635,6 +640,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
@@ -651,6 +657,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: Some("ioc::domain::example.com".to_string()),
         engine: DetectionEngine::Ioc,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };

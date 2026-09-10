@@ -73,6 +73,7 @@ fn build_yara_alert(
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: chrono::DateTime::<chrono::Utc>::from(test_time()).to_rfc3339(),
             source_seq: None,
