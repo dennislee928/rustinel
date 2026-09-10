@@ -11,17 +11,51 @@ Windows offers exactly four supported ways to refuse an operation while it is
 happening. All four are kernel-mode callbacks, which is why this directory
 exists.
 
-| Callback | What it refuses | Implemented |
+| Callback | What it refuses | Where |
 | --- | --- | --- |
-| `ObRegisterCallbacks` | Handle opens and duplicates against a protected process | Yes, `src/callbacks.c` |
-| `CmRegisterCallbackEx` | Registry writes under a protected key | Yes, `src/callbacks.c` |
-| `FltRegisterFilter` | File I/O against a protected path | Not yet |
-| `FwpsCalloutRegister` | Packets, after inspecting payload | No, and not planned |
+| `ObRegisterCallbacks` | Handle opens and duplicates against a protected process | `src/callbacks.c` |
+| `CmRegisterCallbackEx` | Registry writes under a protected key | `src/callbacks.c` |
+| `FltRegisterFilter` | Writes, renames, and deletes against a protected path | `src/minifilter.c` |
+| `PsSetCreateProcessNotifyRoutineEx` | A process, before its first instruction | `src/process.c` |
+| `FwpsCalloutRegister` | Packets, after inspecting payload | Not implemented, and not planned |
 
 The last row is deliberate. WFP *filters* block by address, port, and
 application, they are installed from user mode, and the kernel already enforces
 them; the agent does that today in `src/response/executor/wfp.rs`. A callout is
 only needed to inspect payload bytes, which Rustinel does not do.
+
+`src/process.c` also carries `ZwTerminateProcess`, reachable over
+`IOCTL_RUSTINEL_PROTECT_PROCESS`. It exists because a kernel-mode kill reaches
+targets a user-mode one cannot: a protected-process-light process refuses the
+agent a handle with the rights to terminate it, however privileged the agent is.
+Critical processes are refused there rather than attempted, because terminating
+one bugchecks the machine and the kernel is the last place to catch that.
+
+Thread creation is watched and never denied. Windows offers no supported way to
+refuse a thread; the notification exists so remote-thread injection is reported
+from a channel that cannot be lost to a full trace buffer.
+
+## What is deliberately absent
+
+**ELAM.** An Early Launch Anti-Malware driver classifies boot-start drivers
+before they load, and is the only way to see a rootkit that installs itself
+earlier than an ordinary driver. It is not here because an ELAM driver must be
+signed with a Microsoft-issued Early Launch certificate, which is issued only to
+members of the Microsoft Virus Initiative. That is a membership problem, not a
+code problem, and writing an ELAM driver that cannot be signed would be writing
+something that cannot run.
+
+**ETW Threat Intelligence.** `Microsoft-Windows-Threat-Intelligence` is the only
+source of cross-process memory-write and APC-injection events. Subscribing needs
+the agent to run as a Protected Process Light, which needs an ELAM driver, which
+needs the certificate above. The same wall.
+
+**Hardware telemetry.** Intel Threat Detection Technology is exposed through
+Microsoft Defender and a partner SDK, not a public interface. Intel Processor
+Trace reaches user mode only through `ipt.sys`, which is a debugging transport
+rather than a security one. Neither is reachable for an open-source agent, and
+the honest position is to say so rather than to claim a proxy heuristic is the
+same thing.
 
 ## This driver does not ship
 

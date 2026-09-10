@@ -25,6 +25,11 @@ __drv_dispatchType(IRP_MJ_DEVICE_CONTROL) DRIVER_DISPATCH RustinelDeviceControl;
 
 NTSTATUS RustinelRegisterCallbacks(_In_ PDRIVER_OBJECT DriverObject);
 VOID RustinelUnregisterCallbacks(VOID);
+NTSTATUS RustinelRegisterProcessCallbacks(VOID);
+VOID RustinelUnregisterProcessCallbacks(VOID);
+NTSTATUS RustinelRegisterMinifilter(_In_ PDRIVER_OBJECT DriverObject);
+VOID RustinelUnregisterMinifilter(VOID);
+NTSTATUS RustinelTerminateProcess(_In_ ULONG ProcessId, _In_ ULONG64 StartKey);
 
 /* The live policy. Swapped wholesale; never edited in place. */
 RUSTINEL_POLICY* g_Policy = NULL;
@@ -141,6 +146,22 @@ NTSTATUS RustinelDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Ir
         status = ApplyPolicy((const RUSTINEL_POLICY*)Irp->AssociatedIrp.SystemBuffer);
         break;
 
+    case IOCTL_RUSTINEL_PROTECT_PROCESS: {
+        /*
+         * Terminate from kernel mode. Reaches protected-process targets that
+         * refuse the agent a user-mode handle, and refuses critical processes
+         * rather than bugchecking the machine.
+         */
+        if (inputLength < sizeof(RUSTINEL_PROTECTED_PROCESS)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        const RUSTINEL_PROTECTED_PROCESS* target =
+            (const RUSTINEL_PROTECTED_PROCESS*)Irp->AssociatedIrp.SystemBuffer;
+        status = RustinelTerminateProcess(target->ProcessId, target->StartKey);
+        break;
+    }
+
     case IOCTL_RUSTINEL_CLEAR_POLICY:
         ClearPolicy();
         status = STATUS_SUCCESS;
@@ -176,6 +197,8 @@ VOID RustinelUnload(_In_ PDRIVER_OBJECT DriverObject)
      * a use-after-free on the next handle open, and unregistering waits for
      * in-flight callbacks to finish.
      */
+    RustinelUnregisterMinifilter();
+    RustinelUnregisterProcessCallbacks();
     RustinelUnregisterCallbacks();
     ClearPolicy();
 
@@ -224,6 +247,15 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     DriverObject->DriverUnload = RustinelUnload;
 
     status = RustinelRegisterCallbacks(DriverObject);
+    if (NT_SUCCESS(status)) {
+        /*
+         * Neither of these is fatal on its own. A driver with the object
+         * callbacks but no minifilter still denies handles, and saying which
+         * registered is what `IOCTL_RUSTINEL_QUERY_STATE` is for.
+         */
+        RustinelRegisterProcessCallbacks();
+        RustinelRegisterMinifilter(DriverObject);
+    }
     if (!NT_SUCCESS(status)) {
         /*
          * Almost always STATUS_ACCESS_DENIED from ObRegisterCallbacks on a

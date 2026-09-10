@@ -125,8 +125,7 @@ impl WfpExecutor {
     pub fn isolate_now(&self) -> Result<usize, String> {
         if self.policy.is_empty() {
             return Err(
-                "isolation needs at least one exception; refusing to strand this host"
-                    .to_string(),
+                "isolation needs at least one exception; refusing to strand this host".to_string(),
             );
         }
         platform::isolate(&self.policy, self.persistent)
@@ -248,6 +247,22 @@ mod platform {
     /// FWPM_CONDITION_ALE_APP_ID
     const CONDITION_APP_ID: GUID = GUID::from_u128(0xd78e1e87_8644_4ea5_9437_d809ecefc971);
 
+    /// ERROR_ACCESS_DENIED, by far the most common WFP failure.
+    const ERROR_ACCESS_DENIED: u32 = 5;
+
+    /// Turn a WFP status into something an operator can act on.
+    ///
+    /// Every filtering operation needs administrator rights, and the raw code
+    /// for that is a bare `0x5` that says nothing about which of the many
+    /// possible problems it is.
+    fn describe_wfp_error(operation: &str, status: u32) -> String {
+        if status == ERROR_ACCESS_DENIED {
+            format!("{operation} was denied; filtering operations need administrator rights")
+        } else {
+            format!("{operation} failed: {status:#x}")
+        }
+    }
+
     /// An open engine handle, closed however the caller leaves.
     struct Engine(HANDLE);
 
@@ -266,6 +281,12 @@ mod platform {
                 )
             };
 
+            if status == ERROR_ACCESS_DENIED {
+                return Err(
+                    "FwpmEngineOpen was denied; filtering operations need administrator rights"
+                        .to_string(),
+                );
+            }
             if status != 0 {
                 return Err(format!(
                     "FwpmEngineOpen failed: {status:#x}; is the Base Filtering Engine \
@@ -660,18 +681,49 @@ mod platform {
     /// Enumerating and filtering by sublayer, rather than trusting a stored
     /// list, is what lets isolation be lifted after a reboot or a lost state
     /// file.
+    ///
+    /// Enumeration is per layer, because the default enumeration type is
+    /// `FWP_FILTER_ENUM_FULLY_CONTAINED`, which needs a layer to be contained
+    /// by. A single template with no layer key fails outright rather than
+    /// returning everything.
     fn enumerate_filter_ids(engine: &Engine) -> Result<Vec<u64>, String> {
+        let mut ids = Vec::new();
+        let mut last_error = None;
+
+        for layer in ALL_LAYERS {
+            match enumerate_layer(engine, layer) {
+                Ok(found) => ids.extend(found),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        // Every layer failing means the engine is unusable; some failing is
+        // survivable and the ids that were found are still worth returning.
+        if ids.is_empty() {
+            if let Some(error) = last_error {
+                return Err(error);
+            }
+        }
+
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Rustinel's filter ids within one layer.
+    fn enumerate_layer(engine: &Engine, layer: GUID) -> Result<Vec<u64>, String> {
         let template = FWPM_FILTER_ENUM_TEMPLATE0 {
+            layerKey: layer,
             actionMask: u32::MAX,
             ..Default::default()
         };
 
         let mut enum_handle = HANDLE::default();
-        if unsafe {
+        let status = unsafe {
             FwpmFilterCreateEnumHandle0(engine.handle(), Some(&template), &mut enum_handle)
-        } != 0
-        {
-            return Err("FwpmFilterCreateEnumHandle failed".to_string());
+        };
+        if status != 0 {
+            return Err(describe_wfp_error("FwpmFilterCreateEnumHandle", status));
         }
 
         let mut ids = Vec::new();

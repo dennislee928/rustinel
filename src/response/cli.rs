@@ -83,7 +83,11 @@ fn status(config: &AppConfig, store: &QuarantineStore) -> Result<i32> {
     }
 
     let isolation = &response.actions.isolate_host;
-    if isolation.enabled && isolation.allow_cidrs.is_empty() && !isolation.allow_dns && !isolation.allow_dhcp {
+    if isolation.enabled
+        && isolation.allow_cidrs.is_empty()
+        && !isolation.allow_dns
+        && !isolation.allow_dhcp
+    {
         println!(
             "  WARNING:     isolate_host is enabled with no exceptions, so it will refuse to run"
         );
@@ -172,7 +176,7 @@ fn list_quarantine(store: &QuarantineStore) -> Result<i32> {
         return Ok(0);
     }
 
-    println!("{:<20}  {:>10}  {}", "ID", "SIZE", "ORIGINAL PATH");
+    println!("{:<20}  {:>10}  ORIGINAL PATH", "ID", "SIZE");
     for entry in entries {
         // The id is a SHA-256; the leading 16 characters identify it uniquely
         // enough to type, and `restore` accepts a prefix.
@@ -187,11 +191,7 @@ fn list_quarantine(store: &QuarantineStore) -> Result<i32> {
     Ok(0)
 }
 
-fn restore(
-    store: &QuarantineStore,
-    id: &str,
-    to: Option<&std::path::Path>,
-) -> Result<i32> {
+fn restore(store: &QuarantineStore, id: &str, to: Option<&std::path::Path>) -> Result<i32> {
     let full_id = match store.resolve_id(id) {
         Ok(id) => id,
         Err(error) => {

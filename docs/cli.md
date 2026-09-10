@@ -328,6 +328,64 @@ download rules, copy a temporary executable, or overwrite user configuration.
 `service uninstall` unregisters the native service and preserves configuration,
 rules, logs, and state.
 
+### `response`
+
+Inspect and undo the containment the response engine installs.
+
+```text
+rustinel response <status|isolate|unisolate|quarantine|restore>
+```
+
+Two of the engine's actions leave state that outlives the process that created
+it: WFP filters sit in the kernel until something removes them, and a
+quarantined file sits on disk until something restores it. These commands reach
+that state directly, so they work whether or not the agent is running.
+
+Every subcommand needs administrator or root rights, because the filtering
+engine and the quarantine directory both do.
+
+```powershell
+rustinel response status
+```
+
+```text
+Response
+  mode:        dry run
+  policy:      2 rule(s)
+
+Network containment
+  filters:     none installed
+
+Quarantine
+  files:       3
+  directory:   C:\ProgramData\Rustinel\quarantine
+```
+
+`isolate` cuts the host off the network, keeping only what
+`[response.actions.isolate_host]` names. It refuses to run when that names
+nothing, and prompts unless given `--yes`:
+
+```powershell
+rustinel response isolate --yes
+rustinel response unisolate
+```
+
+`unisolate` finds Rustinel's filters by enumerating the filtering engine rather
+than by reading a state file, so it lifts an isolation that survived a reboot or
+whose state file was lost.
+
+`quarantine` lists what is held; `restore` puts one file back. The id is a
+SHA-256 and a unique prefix is enough:
+
+```powershell
+rustinel response quarantine
+rustinel response restore 3f2a91c4e7b0
+rustinel response restore 3f2a91c4e7b0 --to C:\triage\sample.bin
+```
+
+`--to` restores somewhere other than the original location, which is what an
+analyst wants when restoring for inspection rather than for use.
+
 ## Environment Variables
 
 `RUSTINEL_CONFIG` selects the configuration file, below `--config` in
