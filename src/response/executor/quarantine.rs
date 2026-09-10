@@ -184,6 +184,33 @@ impl QuarantineStore {
         entries
     }
 
+    /// Resolve a possibly-abbreviated id to the full one.
+    ///
+    /// Ids are SHA-256 digests, which nobody types in full. A prefix is
+    /// accepted as long as it names exactly one entry; an ambiguous prefix is
+    /// an error rather than a coin toss over which file gets restored.
+    pub fn resolve_id(&self, prefix: &str) -> Result<String, String> {
+        let prefix = prefix.trim().to_ascii_lowercase();
+        if prefix.is_empty() {
+            return Err("no quarantine id given".to_string());
+        }
+
+        let matches: Vec<String> = self
+            .list()
+            .into_iter()
+            .map(|entry| entry.id)
+            .filter(|id| id.starts_with(&prefix))
+            .collect();
+
+        match matches.len() {
+            0 => Err(format!("no quarantined file matches {prefix}")),
+            1 => Ok(matches.into_iter().next().expect("one match")),
+            count => Err(format!(
+                "{prefix} matches {count} quarantined files; use more characters"
+            )),
+        }
+    }
+
     /// One entry by id.
     pub fn entry(&self, id: &str) -> Result<QuarantineEntry, String> {
         let bytes = fs::read(self.metadata_path(id))

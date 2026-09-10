@@ -11,6 +11,7 @@
 
 pub mod action;
 pub mod audit;
+pub mod cli;
 pub mod executor;
 pub mod policy;
 pub mod safety;

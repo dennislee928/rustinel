@@ -115,6 +115,22 @@ impl WfpExecutor {
     pub fn policy(&self) -> &IsolationPolicy {
         &self.policy
     }
+
+    /// Isolate now, bypassing the action plumbing.
+    ///
+    /// Used by `rustinel response isolate`, where an operator has decided
+    /// directly rather than a detection having decided for them. The refusal
+    /// on an empty exception list still applies: it is a property of
+    /// isolation, not of how it was requested.
+    pub fn isolate_now(&self) -> Result<usize, String> {
+        if self.policy.is_empty() {
+            return Err(
+                "isolation needs at least one exception; refusing to strand this host"
+                    .to_string(),
+            );
+        }
+        platform::isolate(&self.policy, self.persistent)
+    }
 }
 
 impl ActionExecutor for WfpExecutor {

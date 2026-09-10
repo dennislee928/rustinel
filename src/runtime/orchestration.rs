@@ -19,8 +19,23 @@ fn run_portable_command(cli: &Cli) -> Option<anyhow::Result<()>> {
                 config_path: cli.config.clone(),
             }))
         }
+        // Response operations run in this process, not the service, and reach
+        // the same kernel and on-disk state the service does. They are handled
+        // here so they work on every platform and in both install modes.
+        Some(Commands::Response { action }) => Some(run_response_command(action.clone(), cli)),
         _ => None,
     }
+}
+
+/// Load the configuration a response command needs, then run it.
+fn run_response_command(
+    action: crate::response::cli::ResponseAction,
+    cli: &Cli,
+) -> anyhow::Result<()> {
+    let config = crate::config::AppConfig::from_config_path(cli.config.clone())
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    let code = crate::response::cli::run_cli(action, &config)?;
+    std::process::exit(code);
 }
 
 #[cfg(windows)]
@@ -58,6 +73,9 @@ pub fn run() -> anyhow::Result<()> {
         }
         None => crate::runtime::windows::run_console(true, cli.log_level, cli.config),
         Some(Commands::Doctor { .. }) => unreachable!("doctor is handled before service dispatch"),
+        Some(Commands::Response { .. }) => {
+            unreachable!("response is handled before service dispatch")
+        }
         Some(Commands::Replay { .. }) => {
             unreachable!("replay is handled before service dispatch")
         }
@@ -89,6 +107,9 @@ pub fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Commands::Replay { .. }) => unreachable!("replay is handled before platform dispatch"),
+        Some(Commands::Response { .. }) => {
+            unreachable!("response is handled before platform dispatch")
+        }
         Some(Commands::Service { action }) => crate::platform::handle_service_command(action),
         Some(Commands::Doctor { json }) => {
             let code = crate::doctor::run_cli(cli.config, json)?;

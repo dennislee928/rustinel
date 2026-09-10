@@ -88,6 +88,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: RulesAction,
     },
+    /// Inspect and undo the containment the response engine installs
+    Response {
+        #[command(subcommand)]
+        action: crate::response::cli::ResponseAction,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
