@@ -20,6 +20,27 @@ msiexec /i rustinel-1.5.1-x86_64.msi /qn /l*v install.log
 The installer must run elevated. It refuses otherwise rather than failing
 halfway through registering a service, and it refuses on 32-bit Windows.
 
+To download and install in one step, from an elevated PowerShell:
+
+```powershell
+$env:RUSTINEL_MSI='1'; irm https://rustinel.io/install.ps1 | iex
+```
+
+That fetches the `.msi` for the latest release, checks it against the release
+checksum file, and refuses to install unless the Authenticode signature is
+valid. Without `RUSTINEL_MSI`, the same script unpacks the portable `.zip` into
+the current directory for evaluation and installs nothing.
+
+| Variable | Effect |
+| --- | --- |
+| `RUSTINEL_MSI` | `1` to install the MSI instead of the portable archive |
+| `RUSTINEL_MSI_INSTALL_DIR` | Override `C:\Program Files\Rustinel` |
+| `RUSTINEL_VERSION` | Install a specific version instead of the latest |
+
+The signature check is a hard failure for releases from `Karib0u/rustinel`,
+where every release is signed. For a fork, which has no access to the signing
+credentials, an unsigned MSI is a warning instead.
+
 ### What lands where
 
 | Path | Contents |

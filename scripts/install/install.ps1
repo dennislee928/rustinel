@@ -3,7 +3,15 @@ param(
     [string]$Version = "latest",
     [string]$InstallDir = (Join-Path (Get-Location) "rustinel"),
     [switch]$Run,
-    [switch]$Force
+    [switch]$Force,
+    # Install the signed MSI and register the Windows service, instead of
+    # unpacking the portable archive for evaluation. Off by default: the
+    # streamed one-liner is an evaluation path, and an installer that
+    # registers a SYSTEM service should be asked for rather than assumed.
+    [switch]$Msi,
+    # Where the MSI puts the agent. Ignored by the portable path, which uses
+    # -InstallDir.
+    [string]$MsiInstallDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,6 +97,101 @@ function Show-PortableEvaluation {
     Write-Host "  Get-Content `"$Path\logs\alerts.json.*`""
     Write-Host ""
     Show-PromotionCommand -Path $Path
+    Write-Host ""
+    Write-Host "For a permanent install, the signed MSI registers the service and owns"
+    Write-Host "upgrades and uninstall. From an elevated PowerShell:"
+    Write-Host "  `$env:RUSTINEL_MSI='1'; irm https://rustinel.io/install.ps1 | iex"
+}
+
+function Test-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-InstallerSignature {
+    param(
+        [string]$Path,
+        [string]$SourceRepo
+    )
+
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+
+    if ($signature.Status -eq "Valid") {
+        Write-Host "Publisher: $($signature.SignerCertificate.Subject)"
+        if (-not $signature.TimeStamperCertificate) {
+            Write-Warning "The signature is not timestamped; it stops validating when the certificate expires."
+        }
+        return
+    }
+
+    # HashMismatch means the file was altered after it was signed. That is the
+    # one status that is never explainable by a missing certificate, so it is
+    # refused no matter where the release came from.
+    if ($signature.Status -eq "HashMismatch") {
+        throw "Refusing to install: the MSI does not match its own signature. It was altered after signing."
+    }
+
+    # A release from the official repository is always signed. Anything else
+    # there means the artifact is not what it claims to be, and this installer
+    # is about to hand it SYSTEM.
+    if ($SourceRepo -eq "Karib0u/rustinel") {
+        throw "Refusing to install: the MSI signature is $($signature.Status). Official releases are signed. Report this at https://github.com/$SourceRepo/security"
+    }
+
+    # A fork has no access to the signing credentials, so it cannot establish a
+    # publisher. The checksum check above still proves the download matches the
+    # release it came from; what is missing is any evidence about who produced
+    # that release.
+    Write-Warning "No valid publisher signature on the MSI from $SourceRepo (status: $($signature.Status))."
+    Write-Warning "Only continue if you trust that repository."
+}
+
+function Install-Msi {
+    param(
+        [string]$MsiPath,
+        [string]$TargetDir
+    )
+
+    if (-not (Test-Administrator)) {
+        throw "The MSI registers a Windows service and must be installed from an elevated PowerShell. Re-run this as Administrator, or omit -Msi for the portable evaluation package."
+    }
+
+    $log = Join-Path ([System.IO.Path]::GetTempPath()) "rustinel-msi-$([System.Guid]::NewGuid()).log"
+    $arguments = @("/i", "`"$MsiPath`"", "/qn", "/norestart", "/l*v", "`"$log`"")
+    if ($TargetDir) {
+        $arguments += "INSTALLFOLDER=`"$TargetDir`""
+    }
+
+    Write-Host "Running msiexec (log: $log)"
+    $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+
+    # 3010 is ERROR_SUCCESS_REBOOT_REQUIRED. The install succeeded; something
+    # held a file open. Treating it as a failure would send the operator
+    # chasing a problem they do not have.
+    if ($process.ExitCode -eq 3010) {
+        Write-Warning "Installed. A reboot is required to finish replacing a file in use."
+    }
+    elseif ($process.ExitCode -ne 0) {
+        throw "msiexec failed with exit code $($process.ExitCode). Verbose log: $log"
+    }
+
+    Write-Host ""
+    Write-Host "Rustinel installed. The service is registered as 'Rustinel' and starts at boot."
+    Write-Host "  Status:  Get-Service Rustinel"
+    Write-Host "  Config:  $env:ProgramData\Rustinel\config.toml"
+    Write-Host "  Alerts:  $env:ProgramData\Rustinel\logs"
+    Write-Host ""
+    Write-Host "The installer deliberately ships no detection rules. Install them with:"
+    Write-Host "  & `"$env:ProgramFiles\Rustinel\rustinel.exe`" rules install essential"
+    Write-Host ""
+    # Not "msiexec /x $MsiPath": this script downloaded the MSI to a temporary
+    # directory it deletes on the way out. Windows keeps its own cached copy,
+    # which is what the ProductCode below reaches.
+    Write-Host "Uninstall from Apps & Features, or by ProductCode:"
+    Write-Host "  `$key = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |"
+    Write-Host "      Where-Object DisplayName -eq 'Rustinel'"
+    Write-Host "  msiexec /x `$key.PSChildName /qn"
 }
 
 $InvokedFromStream = [string]::IsNullOrEmpty($PSCommandPath)
@@ -113,10 +216,29 @@ if (-not $PSBoundParameters.ContainsKey("Force") -and (Test-TruthyEnv $env:RUSTI
     $Force = $true
 }
 
-$RunEvaluation = [bool]$Run -or $InvokedFromStream
+if (-not $PSBoundParameters.ContainsKey("Msi") -and (Test-TruthyEnv $env:RUSTINEL_MSI)) {
+    $Msi = $true
+}
+
+if (-not $PSBoundParameters.ContainsKey("MsiInstallDir") -and -not [string]::IsNullOrWhiteSpace($env:RUSTINEL_MSI_INSTALL_DIR)) {
+    $MsiInstallDir = $env:RUSTINEL_MSI_INSTALL_DIR
+}
+
+# The MSI installs a service that runs on its own; there is nothing to launch
+# in the foreground and nothing to evaluate in a temporary directory. Running
+# the evaluation path afterwards would start a second, portable agent
+# competing with the service for the same ETW sessions.
+$RunEvaluation = (-not $Msi) -and ([bool]$Run -or $InvokedFromStream)
 
 if (-not [Environment]::Is64BitOperatingSystem) {
     throw "Only 64-bit Windows is supported by the published release archive."
+}
+
+# Checked before the download rather than after it. The MSI refuses to install
+# unelevated anyway, and finding that out is cheaper before pulling tens of
+# megabytes than after.
+if ($Msi -and -not (Test-Administrator)) {
+    throw "The MSI registers a Windows service and must be installed from an elevated PowerShell. Re-run this as Administrator, or drop -Msi/RUSTINEL_MSI for the portable evaluation package."
 }
 
 if ($Version -eq "latest") {
@@ -126,7 +248,11 @@ if ($Version -eq "latest") {
     $Version = $Version.TrimStart("v")
 }
 
-$asset = "rustinel-$Version-x86_64-pc-windows-msvc.zip"
+if ($Msi) {
+    $asset = "rustinel-$Version-x86_64.msi"
+} else {
+    $asset = "rustinel-$Version-x86_64-pc-windows-msvc.zip"
+}
 $checksums = "rustinel-$Version-checksums-sha256.txt"
 $baseUrl = "https://github.com/$Repo/releases/download/v$Version"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "rustinel-install-$([System.Guid]::NewGuid())"
@@ -161,6 +287,17 @@ try {
     $actual = (Get-FileHash -Algorithm SHA256 $assetPath).Hash.ToLowerInvariant()
     if ($actual -ne $expected) {
         throw "Checksum mismatch for $asset. Expected $expected, got $actual."
+    }
+
+    if ($Msi) {
+        # The checksum above proves the download matches the release; the
+        # signature proves the release came from whoever owns the certificate.
+        # Both matter, and neither substitutes for the other: a checksum file
+        # fetched from the same place as the artifact is only as trustworthy
+        # as that place.
+        Assert-InstallerSignature -Path $assetPath -SourceRepo $Repo
+        Install-Msi -MsiPath $assetPath -TargetDir $MsiInstallDir
+        return
     }
 
     $extractDir = Join-Path $tmp "extract"

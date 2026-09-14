@@ -633,6 +633,67 @@ jobs:
       - name: Stage Windows installer
         run: cp dist/windows-installer/*.msi .
 
+      # The build job is allowed to produce unsigned Windows artifacts, because
+      # a fork has no access to the signing secrets and should still be able to
+      # cut a release of its own. This repository is not allowed to publish one.
+      #
+      # The gate is deliberately not conditioned on the secret being present.
+      # Every signing step in the build job is skipped when SM_API_KEY is
+      # absent, so a secret that was deleted, rotated, or left to expire turns
+      # a signed release into an unsigned one with no failure anywhere. That is
+      # the case this catches: an MSI asks a user to hand it SYSTEM, and an
+      # unsigned one teaches them to click past the warning that says not to.
+      #
+      # Both Windows artifacts are checked. The portable zip carries the same
+      # agent binary as the MSI, and shipping a signed installer beside an
+      # unsigned executable would undo the point of signing either.
+      - name: Refuse to publish unsigned Windows artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SIGNING_REQUIRED: ${{ github.repository == 'Karib0u/rustinel' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends osslsigncode
+
+          ca=/etc/ssl/certs/ca-certificates.crt
+          status=0
+
+          # osslsigncode reads both Authenticode containers: the certificate
+          # table of a PE, and the digital signature stream of an MSI.
+          for artifact in "rustinel-${VERSION}-x86_64.msi" dist/windows-x86_64/rustinel.exe; do
+            test -f "$artifact"
+            echo "--- $artifact"
+            report="$(osslsigncode verify -CAfile "$ca" -TSA-CAfile "$ca" -in "$artifact" 2>&1 || true)"
+            echo "$report"
+
+            # Matched positively. If a future osslsigncode renames its verdict,
+            # this falls through to the error below and fails the release
+            # rather than waving an unverified artifact through.
+            if grep -qi 'Signature verification: ok' <<<"$report"; then
+              echo "$artifact carries a verified Authenticode signature."
+              continue
+            fi
+
+            if grep -qi 'No signature found' <<<"$report"; then
+              if [ "$SIGNING_REQUIRED" = true ]; then
+                echo "::error::$artifact is unsigned. The signing credentials are"
+                echo "::error::missing or expired; see docs/windows-installer.md."
+                status=1
+              else
+                echo "::warning::$artifact is unsigned. Forks have no signing credentials."
+              fi
+              continue
+            fi
+
+            # Signed, but the signature did not verify. Either the artifact was
+            # altered after signing, or the chain could not be built from the
+            # runner trust store. Neither is something to publish through.
+            echo "::error::$artifact is signed but its signature did not verify."
+            status=1
+          done
+
+          exit "$status"
+
       - name: Stage macOS packages
         run: |
           cp dist/macos-arm64/*.tar.gz .
@@ -713,6 +774,16 @@ jobs:
             ```
 
             **Windows (PowerShell)**
+
+            Permanent install, from an elevated prompt. Installs the signed MSI
+            and registers the service:
+
+            ```powershell
+            $env:RUSTINEL_VERSION='${{ steps.version.outputs.version }}'; $env:RUSTINEL_MSI='1'; irm https://rustinel.io/install.ps1 | iex; Remove-Item Env:\RUSTINEL_VERSION, Env:\RUSTINEL_MSI -ErrorAction SilentlyContinue
+            ```
+
+            Portable evaluation, which unpacks into the current directory and
+            installs nothing:
 
             ```powershell
             $env:RUSTINEL_VERSION='${{ steps.version.outputs.version }}'; irm https://rustinel.io/install.ps1 | iex; Remove-Item Env:\RUSTINEL_VERSION -ErrorAction SilentlyContinue

@@ -216,6 +216,33 @@ jobs:
         shell: pwsh
         run: ./scripts/windows/verify-msi.ps1 -Path (Get-Item dist/*.msi).FullName
 
+      # The MSI filename is spelled out in three places that never see each
+      # other: build-msi.ps1, the release workflow's checksum and asset lists,
+      # and install.ps1. A rename that misses the release workflow fails the
+      # release loudly. One that misses install.ps1 fails nowhere: the script
+      # goes on asking for a file no release contains, and the first person to
+      # find out is a user running the install one-liner.
+      - name: Check the installer filename matches what install.ps1 fetches
+        shell: pwsh
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Could not read the package version from Cargo.toml" }
+          $version = $match.Matches[0].Groups[1].Value
+
+          $built = (Get-Item dist/*.msi).Name
+          $expected = "rustinel-$version-x86_64.msi"
+          if ($built -ne $expected) {
+            throw "build-msi.ps1 produced '$built' but the release workflow publishes '$expected'"
+          }
+
+          # install.ps1 builds the same name from its own $Version. Asserting
+          # the literal keeps this check honest without running the installer.
+          $script = Get-Content scripts/install/install.ps1 -Raw
+          if ($script -notmatch '"rustinel-\$Version-x86_64\.msi"') {
+            throw "install.ps1 no longer constructs the MSI asset name as 'rustinel-`$Version-x86_64.msi'; update this check and the release workflow together"
+          }
+          Write-Output "Installer filename agrees across build-msi.ps1, install.ps1 and the release workflow: $expected"
+
   test-macos:
     name: Tests (macOS)
     runs-on: macos-latest

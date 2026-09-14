@@ -81,13 +81,20 @@ function Find-SignTool {
 }
 
 function Test-KeyLockerConfigured {
-    # All five are needed; a partial configuration is a misconfiguration rather
+    # All six are needed; a partial configuration is a misconfiguration rather
     # than a reason to fall back silently to something less safe.
+    #
+    # SM_KEYPAIR_ALIAS is checked even though signtool is given the certificate
+    # by thumbprint. It is passed as /kc, and an empty /kc argument does not
+    # fail loudly: signtool is handed a blank key container name and reports a
+    # key it cannot open, which reads like an HSM outage rather than a missing
+    # variable.
     return $env:SM_API_KEY -and
            $env:SM_CLIENT_CERT_FILE -and
            $env:SM_CLIENT_CERT_PASSWORD -and
            $env:SM_HOST -and
-           $env:SM_CODE_SIGNING_CERT_SHA1_HASH
+           $env:SM_CODE_SIGNING_CERT_SHA1_HASH -and
+           $env:SM_KEYPAIR_ALIAS
 }
 
 function Test-PfxConfigured {
