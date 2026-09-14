@@ -137,6 +137,10 @@ fn ecs_category_coverage_maps_event_contract_fields() {
                 1,
                 1,
                 EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                     image_source: None,
                     image_truncated: None,
@@ -193,6 +197,7 @@ fn ecs_category_coverage_maps_event_contract_fields() {
                 11,
                 64,
                 EventFields::FileEvent(FileEventFields {
+                    persistence_mechanism: None,
                     source_filename: None,
                     target_filename: Some(r"C:\Temp\payload.dll".to_string()),
                     process_id: Some("111".to_string()),
@@ -256,6 +261,8 @@ fn ecs_category_coverage_maps_event_contract_fields() {
                 7,
                 10,
                 EventFields::ImageLoad(ImageLoadFields {
+                    hashes: None,
+                    signature_status: None,
                     image_loaded: Some(r"C:\Temp\payload.dll".to_string()),
                     process_id: Some("111".to_string()),
                     image: Some(r"C:\Windows\System32\rundll32.exe".to_string()),
@@ -500,6 +507,10 @@ fn ecs_version_field_is_9_4_0() {
         1,
         1,
         EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
             image_source: None,
             image_truncated: None,
@@ -531,6 +542,10 @@ fn ecs_process_image_truncation_marker_is_preserved() {
         1,
         1,
         EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(long_prefix),
             image_source: None,
             image_truncated: Some(true),
@@ -576,6 +591,10 @@ fn test_rule_id_mapping_and_omit_behavior() {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                 image_source: None,
                 image_truncated: None,

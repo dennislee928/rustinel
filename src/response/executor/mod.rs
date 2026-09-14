@@ -16,8 +16,10 @@
 //! as unsupported until that driver exists.
 
 pub mod asep;
+pub mod host_firewall;
 pub mod quarantine;
 pub mod ring3;
+pub mod unix_service;
 pub mod wfp;
 
 #[cfg(windows)]
@@ -149,6 +151,49 @@ pub trait ActionExecutor: Send + Sync + fmt::Debug {
     }
 }
 
+/// How many containment rules this host currently has installed.
+///
+/// WFP filters on Windows, nftables or `pf` rules elsewhere. One function so
+/// the platform choice is made here rather than at every call site, and so a
+/// caller cannot accidentally ask the wrong backend and be told "none".
+pub fn installed_containment_count() -> Result<usize, String> {
+    #[cfg(windows)]
+    {
+        wfp::installed_filter_count()
+    }
+    #[cfg(not(windows))]
+    {
+        host_firewall::installed_rule_count()
+    }
+}
+
+/// Lift every containment rule Rustinel installed on this host.
+pub fn lift_containment() -> Result<usize, String> {
+    #[cfg(windows)]
+    {
+        wfp::unisolate()
+    }
+    #[cfg(not(windows))]
+    {
+        host_firewall::unisolate()
+    }
+}
+
+/// Isolate this host now, on whichever backend the platform has.
+pub fn isolate_now(
+    policy: wfp::IsolationPolicy,
+    #[cfg_attr(not(windows), allow(unused_variables))] persistent: bool,
+) -> Result<usize, String> {
+    #[cfg(windows)]
+    {
+        wfp::WfpExecutor::new(policy, persistent).isolate_now()
+    }
+    #[cfg(not(windows))]
+    {
+        host_firewall::HostFirewallExecutor::new(policy).isolate_now()
+    }
+}
+
 /// The executor to use on this platform, assembled from the specialised ones.
 ///
 /// Built once, at engine construction: an executor owns operating-system
@@ -158,10 +203,36 @@ pub fn default_executor(config: &crate::config::ResponseConfig) -> Arc<dyn Actio
     // The driver goes first: when one is loaded it denies the operation
     // outright, and the user-mode executors below only clean up after it.
     #[cfg(windows)]
-    let mut executors: Vec<Arc<dyn ActionExecutor>> = vec![
-        Arc::new(driver::KernelDriverExecutor::new()),
-        Arc::new(ring3::Ring3Executor::new()),
-    ];
+    let mut executors: Vec<Arc<dyn ActionExecutor>> = {
+        let kernel = driver::KernelDriverExecutor::new();
+
+        // The first thing worth denying is an attempt to disarm the agent, and
+        // it is worth denying before any detection has fired. Pushed here
+        // rather than from configuration because it protects the agent from
+        // being stopped, which is not an operator preference.
+        //
+        // A failure is logged and survived: the driver is optional, and an
+        // agent that refused to start because it could not protect itself
+        // would be less useful than one running unprotected.
+        if kernel.driver_present() {
+            match kernel.protect_self() {
+                Ok(()) => tracing::info!(
+                    target: "response",
+                    "Kernel driver is protecting the agent process and its service key"
+                ),
+                Err(error) => tracing::warn!(
+                    target: "response",
+                    %error,
+                    "Kernel driver is loaded but would not accept the self-protection policy"
+                ),
+            }
+        }
+
+        vec![
+            Arc::new(kernel) as Arc<dyn ActionExecutor>,
+            Arc::new(ring3::Ring3Executor::new()),
+        ]
+    };
     #[cfg(not(windows))]
     let mut executors: Vec<Arc<dyn ActionExecutor>> = vec![Arc::new(ring3::Ring3Executor::new())];
 
@@ -170,18 +241,36 @@ pub fn default_executor(config: &crate::config::ResponseConfig) -> Arc<dyn Actio
         agent_owned_directories(),
     )));
 
+    let isolation_policy = wfp::IsolationPolicy {
+        allow_cidrs: config.actions.isolate_host.allow_cidrs.clone(),
+        allow_dns: config.actions.isolate_host.allow_dns,
+        allow_dhcp: config.actions.isolate_host.allow_dhcp,
+    };
+
+    // WFP on Windows, nftables or pf everywhere else. Both are kernel packet
+    // filters, so isolation is enforced rather than cleaned up after on all
+    // three platforms; before this, it simply failed on Linux and macOS.
+    #[cfg(windows)]
     executors.push(Arc::new(wfp::WfpExecutor::new(
-        wfp::IsolationPolicy {
-            allow_cidrs: config.actions.isolate_host.allow_cidrs.clone(),
-            allow_dns: config.actions.isolate_host.allow_dns,
-            allow_dhcp: config.actions.isolate_host.allow_dhcp,
-        },
+        isolation_policy,
         config.actions.isolate_host.persistent,
+    )));
+    #[cfg(not(windows))]
+    executors.push(Arc::new(host_firewall::HostFirewallExecutor::new(
+        isolation_policy,
     )));
 
     #[cfg(windows)]
     {
         executors.push(Arc::new(windows::WindowsExecutor::new()));
+    }
+
+    // systemd and launchd. A LaunchAgent is the most common macOS persistence
+    // there is, and killing the process it starts accomplishes nothing on its
+    // own: launchd starts it again, which is what a launch item is for.
+    #[cfg(not(windows))]
+    {
+        executors.push(Arc::new(unix_service::UnixServiceExecutor::new()));
     }
 
     Arc::new(CompositeExecutor::new(executors))

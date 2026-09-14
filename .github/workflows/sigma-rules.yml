@@ -38,9 +38,25 @@ jobs:
           # Full history so the action can diff rule fields against the PR merge-base.
           fetch-depth: 0
           persist-credentials: false
+      # The linter and the engine must agree on what Sigma means. When the
+      # linter is older, it accepts rules the engine will reject at load and
+      # rejects rules the engine handles; either way the gate stops describing
+      # the engine that actually runs. This pin drifted from 0.18 to 0.21 once
+      # already, silently, which is why it is now checked rather than trusted.
+      - name: Check the rsigma pin matches the engine
+        run: |
+          crate="$(grep -oP '^rsigma-parser = "\K[^"]+' Cargo.toml)"
+          pinned="$(grep -oP '^\s+version: v\K[0-9]+\.[0-9]+' .github/workflows/sigma-rules.yml)"
+          echo "engine rsigma-parser: $crate, linter pin: $pinned"
+          if [ "$crate" != "$pinned" ]; then
+            echo "::error::Cargo.toml uses rsigma-parser $crate but this workflow pins the"
+            echo "::error::rsigma linter at v$pinned. Bump the two together."
+            exit 1
+          fi
+
       - uses: timescale/rsigma-action@73ef3bcf8dfea1bb771877e4b8724ce80704660f # v1.0.0
         with:
           # Pinned to the rsigma release whose library crates back the engine
           # integration; bump alongside the rsigma-parser/rsigma-eval dependency.
-          version: v0.18.0
+          version: v0.21.0
           rules: rules/sigma

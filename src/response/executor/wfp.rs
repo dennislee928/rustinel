@@ -51,6 +51,23 @@ const WEIGHT_BLOCK: u64 = 0x1000;
 /// this ordering is the whole safety mechanism for isolation.
 const WEIGHT_PERMIT: u64 = 0x2000;
 
+/// Display name given to isolation's block filters.
+///
+/// Filters are identified by this name when an isolation is replaced, so it is
+/// part of the on-host contract rather than a label. [`ISOLATE_EXCEPTION_NAME`]
+/// deliberately extends it: one prefix match then reaches the whole isolation
+/// and nothing else in the sublayer.
+const ISOLATE_NAME: &str = "Rustinel isolate";
+
+/// Display name given to isolation's permit filters.
+const ISOLATE_EXCEPTION_NAME: &str = "Rustinel isolate exception";
+
+/// Display name given to per-image network blocks.
+///
+/// Outside the [`ISOLATE_NAME`] prefix on purpose: blocking an image is a
+/// separate decision, and replacing an isolation must not lift it.
+const BLOCK_IMAGE_NAME: &str = "Rustinel block image";
+
 /// What must keep working while a host is isolated.
 ///
 /// Empty means isolation is refused: an operator who has not said what to keep
@@ -253,7 +270,10 @@ pub fn installed_filter_count() -> Result<usize, String> {
 
 #[cfg(windows)]
 mod platform {
-    use super::{IsolationPolicy, PROVIDER_GUID, SUBLAYER_GUID, WEIGHT_BLOCK, WEIGHT_PERMIT};
+    use super::{
+        IsolationPolicy, BLOCK_IMAGE_NAME, ISOLATE_EXCEPTION_NAME, ISOLATE_NAME, PROVIDER_GUID,
+        SUBLAYER_GUID, WEIGHT_BLOCK, WEIGHT_PERMIT,
+    };
     use ipnetwork::IpNetwork;
     use std::path::Path;
     use windows::core::{GUID, PCWSTR, PWSTR};
@@ -483,6 +503,18 @@ mod platform {
             return Err("FwpmTransactionBegin failed".to_string());
         }
 
+        // Isolating converges on the requested policy instead of adding to
+        // whatever is already installed. Without this, isolating twice leaves
+        // two full sets of filters, and an operator who widened their
+        // exceptions and re-isolated would still be judged by the old set:
+        // the stale block sits at the same weight as the new permit, and WFP
+        // breaks that tie by arrival order, not by intent.
+        //
+        // Scoped to isolation's own filters by name. A `BlockProcessNetwork`
+        // filter lives in the same sublayer and is a separate decision that an
+        // unrelated isolate must not quietly lift.
+        let replaced = remove_filters_named(&engine, ISOLATE_NAME);
+
         let installed = install_isolation(&engine, policy, persistent);
 
         if installed == 0 {
@@ -499,13 +531,22 @@ mod platform {
             return Err("FwpmTransactionCommit failed".to_string());
         }
 
+        if replaced > 0 {
+            tracing::debug!(
+                target: "response",
+                replaced,
+                installed,
+                "Replaced an existing isolation rather than stacking a second one"
+            );
+        }
+
         Ok(installed)
     }
 
     /// The filters that make up an isolation, inside an open transaction.
     fn install_isolation(engine: &Engine, policy: &IsolationPolicy, persistent: bool) -> usize {
-        let mut block_name = Wide::new("Rustinel isolate");
-        let mut permit_name = Wide::new("Rustinel isolate exception");
+        let mut block_name = Wide::new(ISOLATE_NAME);
+        let mut permit_name = Wide::new(ISOLATE_EXCEPTION_NAME);
         let mut block_weight = WEIGHT_BLOCK;
         let mut permit_weight = WEIGHT_PERMIT;
         let mut installed = 0usize;
@@ -702,7 +743,7 @@ mod platform {
             },
         };
 
-        let mut name = Wide::new("Rustinel block image");
+        let mut name = Wide::new(BLOCK_IMAGE_NAME);
         let mut weight = WEIGHT_BLOCK;
         let mut installed = 0usize;
 
@@ -770,7 +811,7 @@ mod platform {
     /// Remove every filter under Rustinel's sublayer.
     pub(super) fn remove_all() -> Result<usize, String> {
         let engine = Engine::open()?;
-        let ids = enumerate_filter_ids(&engine)?;
+        let ids = enumerate_filter_ids(&engine, None)?;
 
         let mut removed = 0usize;
         for id in ids {
@@ -782,10 +823,36 @@ mod platform {
         Ok(removed)
     }
 
+    /// Delete the filters whose display name starts with `prefix`.
+    ///
+    /// Best-effort by design: this runs inside an open transaction where the
+    /// install that follows is what matters. A filter that could not be
+    /// enumerated is left alone rather than failing the isolation.
+    fn remove_filters_named(engine: &Engine, prefix: &str) -> usize {
+        let Ok(ids) = enumerate_filter_ids(engine, Some(prefix)) else {
+            return 0;
+        };
+
+        ids.into_iter()
+            .filter(|id| unsafe { FwpmFilterDeleteById0(engine.handle(), *id) } == 0)
+            .count()
+    }
+
     /// How many filters Rustinel has installed.
     pub(super) fn count() -> Result<usize, String> {
         let engine = Engine::open()?;
-        Ok(enumerate_filter_ids(&engine)?.len())
+        Ok(enumerate_filter_ids(&engine, None)?.len())
+    }
+
+    /// A filter's display name, when it has a readable one.
+    fn filter_name(filter: &FWPM_FILTER0) -> Option<String> {
+        let name = filter.displayData.name;
+        if name.is_null() {
+            return None;
+        }
+        // SAFETY: WFP owns this buffer until `FwpmFreeMemory0`, and the string
+        // is read and copied before the caller frees the enumeration.
+        unsafe { name.to_string().ok() }
     }
 
     /// Every filter id under Rustinel's sublayer.
@@ -798,12 +865,15 @@ mod platform {
     /// `FWP_FILTER_ENUM_FULLY_CONTAINED`, which needs a layer to be contained
     /// by. A single template with no layer key fails outright rather than
     /// returning everything.
-    fn enumerate_filter_ids(engine: &Engine) -> Result<Vec<u64>, String> {
+    fn enumerate_filter_ids(
+        engine: &Engine,
+        name_prefix: Option<&str>,
+    ) -> Result<Vec<u64>, String> {
         let mut ids = Vec::new();
         let mut last_error = None;
 
         for layer in ALL_LAYERS {
-            match enumerate_layer(engine, layer) {
+            match enumerate_layer(engine, layer, name_prefix) {
                 Ok(found) => ids.extend(found),
                 Err(error) => last_error = Some(error),
             }
@@ -823,7 +893,11 @@ mod platform {
     }
 
     /// Rustinel's filter ids within one layer.
-    fn enumerate_layer(engine: &Engine, layer: GUID) -> Result<Vec<u64>, String> {
+    fn enumerate_layer(
+        engine: &Engine,
+        layer: GUID,
+        name_prefix: Option<&str>,
+    ) -> Result<Vec<u64>, String> {
         let template = FWPM_FILTER_ENUM_TEMPLATE0 {
             layerKey: layer,
             actionMask: u32::MAX,
@@ -855,9 +929,15 @@ mod platform {
         {
             for index in 0..returned as usize {
                 let filter = unsafe { &**entries.add(index) };
-                if filter.subLayerKey == SUBLAYER_GUID {
-                    ids.push(filter.filterId);
+                if filter.subLayerKey != SUBLAYER_GUID {
+                    continue;
                 }
+                if let Some(prefix) = name_prefix {
+                    if !filter_name(filter).is_some_and(|name| name.starts_with(prefix)) {
+                        continue;
+                    }
+                }
+                ids.push(filter.filterId);
             }
             unsafe {
                 FwpmFreeMemory0(&mut (entries as *mut core::ffi::c_void));
@@ -897,6 +977,26 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replacing an isolation finds its filters by display-name prefix, so
+    /// these three names are a contract, not labels.
+    ///
+    /// If the exception name stopped extending the block name, re-isolating
+    /// would delete the blocks and leave the old permits behind — a host that
+    /// believes it is contained while its previous exceptions still stand. If
+    /// the image block ever fell under the same prefix, an unrelated isolate
+    /// would silently lift a block someone else asked for.
+    #[test]
+    fn isolation_filter_names_keep_their_prefix_relationship() {
+        assert!(
+            ISOLATE_EXCEPTION_NAME.starts_with(ISOLATE_NAME),
+            "one prefix match must reach both halves of an isolation"
+        );
+        assert!(
+            !BLOCK_IMAGE_NAME.starts_with(ISOLATE_NAME),
+            "a per-image block must survive an isolation being replaced"
+        );
+    }
 
     #[test]
     fn isolation_without_exceptions_is_refused() {

@@ -584,6 +584,27 @@ pub struct ResponseRule {
 pub struct ProcessConfig {
     /// Maximum number of process metadata entries retained
     pub max_entries: usize,
+
+    /// Hash the executable behind process-start and image-load events.
+    ///
+    /// Fills the `Hashes` field the public Sigma corpus matches on. Without
+    /// it those rules load, see every event, and never match, which is the
+    /// worst failure mode a rule has.
+    ///
+    /// The cost is paid on the enrichment thread, between the sensor channel
+    /// and the detection engine, because a hash that arrives after the engine
+    /// has judged the event is a hash no rule can use. Repeats are free: the
+    /// cache is keyed by file identity, and a machine runs the same few
+    /// binaries over and over.
+    pub hash_images: bool,
+
+    /// Largest image that will be hashed, in MiB.
+    ///
+    /// The bound is what keeps a single enormous binary from stalling the
+    /// enrichment thread and shedding telemetry behind it. An image over the
+    /// limit is left without hashes rather than delaying everything queued
+    /// behind it.
+    pub hash_max_file_size_mb: u64,
 }
 
 /// Atomic IOC detection configuration
@@ -763,6 +784,8 @@ impl AppConfig {
             .set_default("response.actions.disable_scheduled_task.enabled", false)?
             // Process cache
             .set_default("process.max_entries", 65536i64)?
+            .set_default("process.hash_images", true)?
+            .set_default("process.hash_max_file_size_mb", 64i64)?
             // IOC
             .set_default("ioc.enabled", true)?
             .set_default("ioc.hashes_path", "rules/current/ioc/hashes.txt")?
@@ -1008,6 +1031,8 @@ impl Default for AppConfig {
             response: ResponseConfig::default(),
             process: ProcessConfig {
                 max_entries: 65_536,
+                hash_images: true,
+                hash_max_file_size_mb: 64,
             },
             ioc: IocConfig {
                 enabled: true,

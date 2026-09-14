@@ -21,7 +21,9 @@ use event::{
     ecs_object_access_category, event_dataset, event_provider, host_os_family, host_os_type,
     network_direction_from_category, network_direction_from_initiated,
 };
-use helpers::{basename, file_extension_from_path, parse_bool, parse_u16, parse_u64};
+use helpers::{
+    basename, file_extension_from_path, parse_bool, parse_u16, parse_u64, split_sysmon_hashes,
+};
 use network::{extract_ips, network_transport_from_opcode, network_type_from_ip};
 use registry::split_registry_path;
 use user::apply_user_fields;
@@ -78,6 +80,12 @@ impl From<&Alert> for EcsAlert {
             process_parent_pid: None,
             process_working_directory: None,
             edr_process_integrity_level: None,
+            process_hash_md5: None,
+            process_hash_sha256: None,
+            process_code_signature_exists: None,
+            process_code_signature_valid: None,
+            process_code_signature_subject_name: None,
+            process_code_signature_status: None,
             process_original_file_name: None,
             process_product: None,
             process_description: None,
@@ -175,6 +183,18 @@ impl From<&Alert> for EcsAlert {
                 ecs.process_description = f.description.clone();
                 ecs.process_company = f.company.clone();
                 ecs.process_file_version = f.file_version.clone();
+                (ecs.process_hash_md5, ecs.process_hash_sha256) =
+                    split_sysmon_hashes(f.hashes.as_deref());
+                // `Signed` is Sysmon's "true"/"false" string. Absent stays
+                // absent: "not checked" is not "unsigned".
+                ecs.process_code_signature_valid = parse_bool(&f.signed);
+                ecs.process_code_signature_exists = ecs.process_code_signature_valid.map(|valid| {
+                    // A status of Unsigned means nothing was there to verify;
+                    // anything else means a signature existed and was judged.
+                    valid || f.signature_status.as_deref() != Some("Unsigned")
+                });
+                ecs.process_code_signature_subject_name = f.signature.clone();
+                ecs.process_code_signature_status = f.signature_status.clone();
                 apply_user_fields(&mut ecs, f.user.as_deref());
                 ecs.edr_process_target_image = f.target_image.clone();
             }
@@ -461,6 +481,10 @@ mod tests {
                 event_id_string: "1".to_string(),
                 opcode: 1,
                 fields: EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                     image_source: None,
                     image_truncated: None,
@@ -859,6 +883,7 @@ mod tests {
                 event_id_string: "11".to_string(),
                 opcode: 64,
                 fields: EventFields::FileEvent(FileEventFields {
+                    persistence_mechanism: None,
                     source_filename: None,
                     target_filename: Some(r"C:\Users\alice\evil.ps1".to_string()),
                     process_id: Some("777".to_string()),

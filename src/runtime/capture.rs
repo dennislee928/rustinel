@@ -113,6 +113,7 @@ impl CaptureContext {
         let progress = spawn_progress_reporter(&recorder);
 
         Ok(CaptureSession {
+            process_config: self.config.process.clone(),
             _context: self,
             recorder,
             router: Arc::new(router),
@@ -130,6 +131,11 @@ pub(crate) struct CaptureSession {
     router: Arc<SensorEventRouter>,
     #[cfg_attr(not(windows), allow(dead_code))]
     process_cache: Arc<ProcessCache>,
+    /// Enrichment settings for the sensor worker. A recording that carries no
+    /// hashes cannot be replayed against a rule that matches on them, so the
+    /// capture path enriches exactly as the live path does.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    process_config: crate::config::ProcessConfig,
     progress: JoinHandle<()>,
 }
 
@@ -145,12 +151,19 @@ impl CaptureSession {
     pub(crate) fn sensor_channel(&self) -> (mpsc::Sender<SensorEvent>, JoinHandle<()>) {
         let (tx, mut rx) = mpsc::channel::<SensorEvent>(SENSOR_CHANNEL_CAPACITY);
         let router = Arc::clone(&self.router);
+        #[cfg(windows)]
+        let process_config = self.process_config.clone();
         let worker = tokio::task::spawn_blocking(move || {
+            // One enricher per worker thread: it owns a hash cache, and the
+            // cache is what keeps hashing off the cost of every event.
+            #[cfg(windows)]
+            let mut enricher = crate::sensor::windows::Enricher::new(&process_config);
+
             while let Some(event) = rx.blocking_recv() {
                 #[cfg(windows)]
                 let event = {
                     let mut event = event;
-                    crate::sensor::windows::enrich_event(&mut event);
+                    enricher.enrich(&mut event);
                     event
                 };
                 router.route_event(&event);

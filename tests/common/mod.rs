@@ -129,6 +129,10 @@ pub fn process_start_event(platform: Platform) -> SensorEvent {
         }),
         parent_process_start_key: None,
         payload: SensorPayload::Process(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(image.to_string()),
             image_source: None,
             image_truncated: None,
@@ -377,6 +381,7 @@ pub fn file_event(
         }),
         parent_process_start_key: None,
         payload: SensorPayload::File(FileEventFields {
+            persistence_mechanism: None,
             source_filename: source_filename.map(ToString::to_string),
             target_filename: target_filename.map(ToString::to_string),
             process_id: Some(TEST_PID.to_string()),

@@ -586,6 +586,10 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some("/usr/bin/curl".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -631,6 +635,10 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: None,
                 image_source: None,
                 image_truncated: None,
@@ -703,6 +711,7 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some("/tmp/sample.txt".to_string()),
                 process_id: Some(pid.to_string()),
@@ -770,6 +779,10 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: None,
                 image_source: None,
                 image_truncated: None,
@@ -898,6 +911,7 @@ mod tests {
             process_start_key: None,
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some("/tmp/test".to_string()),
                 process_id: Some("9".to_string()),
@@ -952,6 +966,7 @@ mod tests {
             process_start_key: None,
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some("/tmp/test".to_string()),
                 process_id: Some("9".to_string()),

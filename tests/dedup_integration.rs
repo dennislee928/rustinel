@@ -34,6 +34,10 @@ fn make_alert(rule: &str, image: &str) -> Alert {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(image.to_string()),
                 image_source: None,
                 image_truncated: None,

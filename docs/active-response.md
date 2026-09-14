@@ -149,14 +149,33 @@ Loopback is permitted unconditionally and is not configurable. A host that
 cannot reach itself loses local inter-process communication over TCP, which
 breaks software that has nothing to do with the incident.
 
-Filters are installed under Rustinel's own WFP provider and sublayer, with
-permit filters weighted above the block so exceptions win. `rustinel response
-unisolate` enumerates by provider rather than trusting a stored list, so
-isolation can be lifted after a reboot, a crash, or a lost state file.
+Each platform uses its own kernel packet filter, so isolation is enforced
+rather than cleaned up after on all three:
 
-With `persistent = true`, the default, filters survive a reboot. That fails
-closed: a host stays isolated even if the agent never starts again, which is the
-safe direction for containment and the dangerous one for reachability.
+| Platform | Backend | How exceptions win |
+| --- | --- | --- |
+| Windows | WFP filters under Rustinel's provider and sublayer | Permit filters weighted above the block |
+| Linux | An `inet` nftables table named `rustinel` | Chain policy is `drop`; exceptions are `accept` rules |
+| macOS | A `pf` anchor named `rustinel` | `block drop all` first, then `pass quick` exceptions |
+
+The Linux table is `inet` rather than `ip` so one ruleset covers IPv4 and IPv6;
+leaving IPv6 unfiltered is the usual way an "isolated" host stays reachable.
+Both Unix backends accept established and related flows, without which an
+accepted outbound connection's replies are dropped on the way back in and every
+exception is one-way. `pf` takes the *last* matching rule unless one says
+`quick`, the opposite of nftables, so every exception there is `quick`.
+
+`rustinel response unisolate` finds what to remove by enumerating the provider,
+table, or anchor rather than trusting a stored list, so isolation can be lifted
+after a reboot, a crash, or a lost state file. Isolating twice converges on the
+requested policy instead of stacking a second copy of it.
+
+With `persistent = true`, the default, Windows filters survive a reboot. That
+fails closed: a host stays isolated even if the agent never starts again, which
+is the safe direction for containment and the dangerous one for reachability.
+The nftables table and the `pf` anchor do not survive a reboot on their own —
+neither backend has an equivalent of WFP's persistent flag — so on Linux and
+macOS a reboot restores network access.
 
 On Windows, `terminate_process` is `OpenProcess` plus `TerminateProcess`, and
 `suspend_process` is `NtSuspendProcess`. `DebugActiveProcess` would also freeze a
@@ -165,6 +184,17 @@ preserving it. On Linux and macOS the two actions are `SIGKILL` and `SIGSTOP`.
 
 A suspended process stays suspended. Nothing resumes it automatically; resume it
 from the platform's own tools once triage is done.
+
+`disable_service` is the Windows service control manager, `systemctl disable
+--now` on Linux, and `launchctl disable` plus `bootout` on macOS. It disables
+and never deletes: the unit file is the evidence of how the host was persisted
+on, and quarantine is the action that takes a file, keeping a restorable copy
+when it does. A compiled-in list refuses the agent's own unit and anything whose
+loss would strand the operator — `sshd`, `systemd-logind`, `loginwindow`.
+
+On macOS this is the action that matters most for persistence. Killing the
+process a LaunchAgent started accomplishes nothing on its own: launchd starts it
+again, which is what a launch item is for.
 
 When a rule selects several actions, they run in a fixed order rather than the
 order written: freeze first, then containment, then termination last, so the

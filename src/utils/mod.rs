@@ -2,6 +2,7 @@
 //!
 //! Provides helper functions for path normalization and PE parsing.
 
+pub mod authenticode;
 pub(crate) mod cache;
 pub(crate) mod file_identity;
 pub mod fs;

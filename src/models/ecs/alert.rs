@@ -197,6 +197,53 @@ pub struct EcsAlert {
     )]
     pub process_file_version: Option<String>,
 
+    /// ECS `process.hash.md5`, lowercase hex.
+    ///
+    /// Split out of the Sysmon-style `Hashes` string the rules match on: ECS
+    /// wants one algorithm per field in lowercase, and a SIEM correlating
+    /// against threat intelligence looks here rather than inside a combined
+    /// string.
+    #[serde(rename = "process.hash.md5", skip_serializing_if = "Option::is_none")]
+    pub process_hash_md5: Option<String>,
+
+    /// ECS `process.hash.sha256`, lowercase hex.
+    #[serde(
+        rename = "process.hash.sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_hash_sha256: Option<String>,
+
+    /// ECS `process.code_signature.exists`: whether a signature was found.
+    #[serde(
+        rename = "process.code_signature.exists",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_exists: Option<bool>,
+
+    /// ECS `process.code_signature.valid`: whether it verified.
+    ///
+    /// Distinct from `exists`: a tampered binary has a signature that does not
+    /// verify, which is a stronger signal than having none at all.
+    #[serde(
+        rename = "process.code_signature.valid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_valid: Option<bool>,
+
+    /// ECS `process.code_signature.subject_name`: who signed it.
+    #[serde(
+        rename = "process.code_signature.subject_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_subject_name: Option<String>,
+
+    /// ECS `process.code_signature.status`: why it was or was not accepted.
+    #[serde(
+        rename = "process.code_signature.status",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_status: Option<String>,
+
     #[serde(rename = "user.name", skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 

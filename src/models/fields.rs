@@ -128,6 +128,37 @@ pub struct ProcessCreationFields {
 
     #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// Image hashes, in Sysmon's `ALGO=VALUE,ALGO=VALUE` spelling.
+    ///
+    /// Sysmon's format rather than separate fields because that is what the
+    /// public Sigma corpus matches on: rules write
+    /// `Hashes|contains: 'SHA256=...'`, so a rule referencing this field only
+    /// fires if the value is spelled the way the rule expects.
+    ///
+    /// Populated off the sensor's hot path; see
+    /// `crate::sensor::windows::enrich_event`.
+    #[serde(rename = "Hashes", skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<String>,
+
+    /// Whether the image carries a valid code signature.
+    ///
+    /// Sysmon's `Signed`. Rules written as `Signed: 'false'` are asking for an
+    /// unsigned binary in a place that should only hold signed ones, so an
+    /// absent value and `false` mean very different things: absent is "not
+    /// checked", and only `false` should fire such a rule.
+    #[serde(rename = "Signed", skip_serializing_if = "Option::is_none")]
+    pub signed: Option<String>,
+
+    /// The signing identity: the certificate subject on Windows, the team
+    /// identifier on macOS.
+    #[serde(rename = "Signature", skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+
+    /// Why a signature was or was not accepted, in Sysmon's vocabulary
+    /// (`Valid`, `Expired`, `Unsigned`, ...).
+    #[serde(rename = "SignatureStatus", skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
 }
 
 /// File event fields (Sigma: file_access, file_delete, file_event)
@@ -153,6 +184,18 @@ pub struct FileEventFields {
         skip_serializing_if = "Option::is_none"
     )]
     pub previous_creation_utc_time: Option<String>,
+
+    /// Which persistence mechanism this path belongs to, when it is one.
+    ///
+    /// Lets a rule ask for `PersistenceMechanism: launch_agent` instead of
+    /// carrying the path list itself, which every rule would otherwise have to
+    /// repeat and keep correct. macOS today; the classifier is in
+    /// `crate::sensor::persistence`.
+    #[serde(
+        rename = "PersistenceMechanism",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub persistence_mechanism: Option<String>,
 
     #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -264,6 +307,18 @@ pub struct DnsQueryFields {
 /// Image load event fields (Sigma: image_load)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageLoadFields {
+    /// Hashes of the loaded image, in Sysmon's `ALGO=VALUE` spelling.
+    ///
+    /// Same contract as `ProcessCreationFields::hashes`: the corpus matches
+    /// this field by substring, so the spelling is what makes a rule fire.
+    #[serde(rename = "Hashes", skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<String>,
+
+    /// Why a signature was or was not accepted, in Sysmon's vocabulary
+    /// (`Valid`, `Expired`, `Unsigned`, ...).
+    #[serde(rename = "SignatureStatus", skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
+
     #[serde(rename = "ImageLoaded", skip_serializing_if = "Option::is_none")]
     pub image_loaded: Option<String>,
 

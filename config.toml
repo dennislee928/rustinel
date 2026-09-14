@@ -153,6 +153,20 @@ allow_dhcp = true
 [process]
 max_entries = 65536 # maximum process records retained when exit events are missed
 
+# Hash the executable behind process-start and image-load events, filling the
+# Sysmon-style `Hashes` field (MD5=...,SHA256=...) that the public Sigma corpus
+# matches on. With this off, every rule matching on a hash still loads and sees
+# every event, and never fires.
+#
+# The hash is computed between the sensor channel and the detection engine,
+# because one that arrives later is one no rule can use. Repeats are cheap: the
+# cache is keyed by file identity and a machine runs the same few binaries over
+# and over. The size limit bounds the first-touch cost, since there is no
+# backpressure behind this thread - anything queued behind a slow hash is shed
+# rather than delayed. Windows only today.
+hash_images = true
+hash_max_file_size_mb = 64
+
 # 6. Behavioral Recording (rustinel capture)
 #   Recordings hold normalized events - command lines, file paths, destinations,
 #   and user names - so treat them like alert output: they are written

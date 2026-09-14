@@ -12,7 +12,7 @@ full rather than hide them.
 
 | Limitation | Area |
 | --- | --- |
-| Process events carry no hashes (`Hashes` / `Imphash`) | Windows |
+| Process events carry no `Imphash`, and no publisher for catalog-signed files | Windows |
 | Several modelled process fields are never populated | Windows |
 | Rules are inert when no collector backs their logsource (counted, not prevented) | Engine |
 | Telemetry is dropped under burst load (counted, not prevented) | Pipeline |
@@ -27,13 +27,23 @@ Telemetry comes from ETW plus Windows Event Log subscriptions on the System and
 Security channels, rather than a kernel driver. Coverage is the broadest of the
 three platforms, but several Sysmon-style fields are unavailable.
 
-- **No process or image-load hashes (silent risk).** There is no
-  `Hashes`/`Imphash` on process or image-load events, so the many Sigma rules
-  keyed on them can never fire. Hashing exists only in the file/IOC scanner.
+- **`Imphash` is still absent.** Process and image-load events now carry
+  `Hashes` as `MD5=...,SHA256=...`, computed during enrichment and controlled by
+  `process.hash_images`. `Imphash` needs the PE import table rather than a
+  digest of the file, and is not computed, so rules keyed on it cannot fire.
+- **Signature revocation is never checked over the network.** `Signed`,
+  `Signature`, and `SignatureStatus` are populated for both embedded and
+  catalog signatures, but verification runs cache-only: a certificate revoked
+  since the last cache refresh still reads as valid. Reaching a CRL or OCSP
+  responder would block the enrichment thread, which sheds telemetry rather
+  than queueing it.
+- **The publisher name is absent for catalog-signed files.** `Signed` and
+  `SignatureStatus` are correct for them, but `Signature` is read out of a
+  certificate in the file, and a catalog-signed binary holds none. Most Windows
+  system binaries are catalog-signed; third-party binaries generally are not.
 - **Some process fields are always empty (silent risk).** `User` and
   `CurrentDirectory` are modelled and exposed to Sigma but never populated by
-  the provider, so rules filtering on them cannot match. `Signed` and
-  `Signature` on image loads are empty for the same reason.
+  the provider, so rules filtering on them cannot match.
 - **`IntegrityLevel` is on process start only.** It is decoded from the
   `MandatoryLabel` SID that Kernel-Process puts on the start event, and named
   the way Sysmon names it (`System`, `High`, `Medium`). Process *stop* events

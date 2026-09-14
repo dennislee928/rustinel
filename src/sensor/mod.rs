@@ -14,6 +14,11 @@ pub mod linux;
 pub mod macos;
 #[cfg(any(windows, test))]
 mod network_events;
+// Compiled for tests everywhere, like `integrity_level`: the logic is pure
+// path handling, and a classifier only exercised on a macOS runner is one
+// whose evasion cases nobody runs.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod persistence;
 #[cfg(windows)]
 pub mod windows;
 
@@ -355,6 +360,10 @@ mod tests {
     #[test]
     fn payload_category_matches_variant() {
         let payload = SensorPayload::Process(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some("/usr/bin/bash".to_string()),
             image_source: None,
             image_truncated: None,
@@ -417,6 +426,7 @@ mod tests {
     #[test]
     fn payload_round_trips_through_event_fields() {
         let payload = SensorPayload::File(FileEventFields {
+            persistence_mechanism: None,
             source_filename: None,
             target_filename: Some("/tmp/example".to_string()),
             process_id: Some("77".to_string()),

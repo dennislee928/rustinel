@@ -420,6 +420,7 @@ mod round_trip_tests {
             event_id_string: "11".to_string(),
             opcode: 64,
             fields: EventFields::FileEvent(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some(r"C:\Temp\rustinel.txt".to_string()),
                 process_id: Some("6120".to_string()),
@@ -511,6 +512,10 @@ mod round_trip_tests {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some("/bin/zsh".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -768,6 +773,10 @@ mod round_trip_tests {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -811,6 +820,10 @@ mod round_trip_tests {
         event.event_id_string = "1".to_string();
         event.opcode = 1;
         event.fields = EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(image.to_string()),
             image_source: None,
             image_truncated: None,

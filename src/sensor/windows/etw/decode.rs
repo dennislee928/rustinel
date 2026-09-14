@@ -304,6 +304,10 @@ pub(super) fn decode_process(
     let current_directory = raw_current_directory.map(|path| convert_nt_to_dos(&path));
 
     let fields = ProcessCreationFields {
+        hashes: None,
+        signed: None,
+        signature: None,
+        signature_status: None,
         image: image.clone(),
         image_source: None,
         image_truncated: None,
@@ -501,6 +505,7 @@ pub(super) fn decode_kernel_file_record(
 fn file_event_fields(parser: &Parser, raw_path: &str) -> Option<FileEventFields> {
     let mappings = field_maps::file_event_mappings();
     Some(FileEventFields {
+        persistence_mechanism: None,
         source_filename: None,
         target_filename: Some(convert_nt_to_dos(raw_path)),
         process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
@@ -798,6 +803,8 @@ pub(super) fn decode_image_load(parser: &Parser, record: &EventRecord) -> Option
         .map(|path| convert_nt_to_dos(&path));
 
     let fields = ImageLoadFields {
+        hashes: None,
+        signature_status: None,
         image_loaded,
         process_id: try_get_uint(parser, mappings.get_etw_field("ProcessId")?),
         image: try_get_string(parser, mappings.get_etw_field("Image")?)

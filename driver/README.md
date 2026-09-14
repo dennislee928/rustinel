@@ -70,6 +70,26 @@ builds and signs it, the agent runs without a driver, `KernelDriverExecutor`
 reports every action unsupported, and the user-mode executors do the work after
 the fact. That is the normal case and nothing about it is broken.
 
+### What the agent side does today
+
+The user-mode half of the interface is implemented, not stubbed:
+`src/response/executor/driver.rs` speaks all four control codes over
+`DeviceIoControl`, mirrors every structure in `include/rustinel_ioctl.h`, and
+pins their sizes, offsets, and control codes in tests so a change to either
+side of the boundary fails in CI rather than on a machine.
+
+With a driver present the agent pushes a self-protection policy at startup —
+its own process, with the rights to read or write its memory or start a thread
+in it stripped, and its service registry key made read-only — routes
+`TerminateProcess` to the kernel-mode terminate, and reports what the driver is
+actually enforcing through `rustinel doctor` (`response_driver_state`), which
+names any callback that failed to register rather than reporting a partially
+registered driver as healthy.
+
+None of that runs on a machine without a signed driver. It means the seam is
+exercised and type-checked rather than assumed, so signing a build is the only
+thing between here and a working one.
+
 ## Design
 
 The driver holds no detection logic. It holds a flat, fixed-size policy table

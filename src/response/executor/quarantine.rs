@@ -116,35 +116,55 @@ impl QuarantineStore {
             .map_err(|err| format!("cannot create {}: {err}", self.root.display()))?;
         restrict_directory(&self.root);
 
+        // Write the stored copy first: a metadata document with no file behind
+        // it would advertise a restore that cannot happen.
+        //
+        // The blob is content-addressed, so an existing one holds these exact
+        // bytes and is reused. Rewriting it would be pointless work; refusing
+        // would fail a quarantine over a file that is already safely stored.
+        let stored = self.blob_path(&id);
+        let mut obfuscated = contents;
+        for byte in &mut obfuscated {
+            *byte ^= OBFUSCATION_BYTE;
+        }
+        let blob_existed = match write_new_io(&stored, &obfuscated) {
+            Ok(()) => false,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(err) => return Err(format!("cannot write {}: {err}", stored.display())),
+        };
+
+        // The metadata is the incident record, and it is not content-addressed:
+        // the same bytes quarantined from a second path is a second event with
+        // a different `original_path`. Overwriting the first record would lose
+        // where that sample came from and send its restore to the wrong place,
+        // so each event gets its own record id.
+        let record_id = self.allocate_record_id(&id);
         let entry = QuarantineEntry {
-            id: id.clone(),
+            id: record_id.clone(),
             original_path: path.to_path_buf(),
             size: metadata.len(),
             quarantined_at: chrono::Utc::now().to_rfc3339(),
             rule_name: rule_name.map(str::to_string),
         };
 
-        // Write the stored copy first: a metadata document with no file behind
-        // it would advertise a restore that cannot happen.
-        let stored = self.blob_path(&id);
-        let mut obfuscated = contents;
-        for byte in &mut obfuscated {
-            *byte ^= OBFUSCATION_BYTE;
-        }
-        write_new(&stored, &obfuscated)?;
-
         let metadata_json = serde_json::to_vec_pretty(&entry)
             .map_err(|err| format!("cannot serialize quarantine metadata: {err}"))?;
-        if let Err(err) = write_new(&self.metadata_path(&id), &metadata_json) {
-            let _ = fs::remove_file(&stored);
+        if let Err(err) = write_new(&self.metadata_path(&record_id), &metadata_json) {
+            // Only clean up a blob this call created. One that was already
+            // there belongs to an earlier record that is still valid.
+            if !blob_existed {
+                let _ = fs::remove_file(&stored);
+            }
             return Err(err);
         }
 
         // Only now is the original removed. Losing the file after this point
         // still leaves a complete, restorable copy.
         fs::remove_file(path).map_err(|err| {
-            let _ = fs::remove_file(&stored);
-            let _ = fs::remove_file(self.metadata_path(&id));
+            let _ = fs::remove_file(self.metadata_path(&record_id));
+            if !blob_existed {
+                let _ = fs::remove_file(&stored);
+            }
             format!("cannot remove {}: {err}", path.display())
         })?;
 
@@ -175,8 +195,14 @@ impl QuarantineStore {
         }
         write_new(&destination, &contents)?;
 
-        let _ = fs::remove_file(self.blob_path(id));
+        // The record goes unconditionally; the blob only when this was the
+        // last record holding those bytes. Removing a shared blob would leave
+        // the other records advertising a restore that cannot happen.
+        let shared = self.blob_is_shared(id);
         let _ = fs::remove_file(self.metadata_path(id));
+        if !shared {
+            let _ = fs::remove_file(self.blob_path(id));
+        }
 
         Ok(destination)
     }
@@ -233,13 +259,52 @@ impl QuarantineStore {
             .map_err(|err| format!("quarantine entry {id} is unreadable: {err}"))
     }
 
+    /// The stored copy backing a record.
+    ///
+    /// Records for the same bytes share one blob, so this addresses it by the
+    /// content hash rather than by the record id.
     fn blob_path(&self, id: &str) -> PathBuf {
-        self.root.join(format!("{id}.bin"))
+        self.root.join(format!("{}.bin", content_hash_of(id)))
     }
 
     fn metadata_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.json"))
     }
+
+    /// A record id for a new quarantine of content `hash`.
+    ///
+    /// The first is the bare hash, which keeps the common case readable. Later
+    /// quarantines of the same bytes take `<hash>.2`, `.3`, and so on.
+    fn allocate_record_id(&self, hash: &str) -> String {
+        if !self.metadata_path(hash).exists() {
+            return hash.to_string();
+        }
+        // Bounded rather than `loop`: a store holding this many records of one
+        // file has a problem that silently spinning here would not fix.
+        for suffix in 2..=10_000u32 {
+            let candidate = format!("{hash}.{suffix}");
+            if !self.metadata_path(&candidate).exists() {
+                return candidate;
+            }
+        }
+        format!(
+            "{hash}.{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        )
+    }
+
+    /// Whether any record other than `id` still needs `id`'s stored copy.
+    fn blob_is_shared(&self, id: &str) -> bool {
+        let hash = content_hash_of(id);
+        self.list()
+            .iter()
+            .any(|entry| entry.id != id && content_hash_of(&entry.id) == hash)
+    }
+}
+
+/// The content hash a record id addresses, dropping any `.n` discriminator.
+fn content_hash_of(id: &str) -> &str {
+    id.split_once('.').map_or(id, |(hash, _)| hash)
 }
 
 /// Whether two paths are on the same volume.
@@ -277,17 +342,24 @@ fn same_volume(left: &Path, right: &Path) -> bool {
 }
 
 /// Write a file, refusing to clobber one that is already there.
+///
+/// `create_new` rather than `create`+`truncate`: this is the only thing
+/// standing between a second quarantine of the same bytes and the loss of the
+/// first one's record. An `AlreadyExists` error is a normal outcome the caller
+/// is expected to handle, not a failure.
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_new_io(path, bytes).map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
+/// [`write_new`], keeping the `io::Error` so a caller can tell "already there"
+/// apart from "could not write".
+fn write_new_io(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
     file.flush()
-        .map_err(|err| format!("cannot flush {}: {err}", path.display()))
 }
 
 /// Keep the quarantine directory out of reach of ordinary users.
@@ -495,6 +567,60 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = QuarantineStore::new(dir.path().join("quarantine"));
         (dir, store)
+    }
+
+    /// The same bytes dropped in two places are two incidents. Before record
+    /// ids were separated from the content hash, the second quarantine wrote
+    /// over the first one's metadata: the first `original_path` was lost, and
+    /// restoring it put the sample back in the wrong directory.
+    #[test]
+    fn quarantining_identical_bytes_twice_keeps_both_records() {
+        let (dir, store) = store();
+        let first = dir.path().join("one").join("dropper.exe");
+        let second = dir.path().join("two").join("dropper.exe");
+        for path in [&first, &second] {
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(path, b"identical malicious contents").expect("write");
+        }
+
+        let one = store.quarantine(&first, Some("Rule A")).expect("first");
+        let two = store.quarantine(&second, Some("Rule B")).expect("second");
+
+        assert_ne!(one.id, two.id, "each quarantine needs its own record id");
+        assert_eq!(store.list().len(), 2, "neither record may be lost");
+        assert_eq!(
+            store.entry(&one.id).expect("first entry").original_path,
+            first
+        );
+        assert_eq!(
+            store.entry(&two.id).expect("second entry").original_path,
+            second
+        );
+
+        // Content-addressed: one blob backs both records.
+        assert_eq!(store.blob_path(&one.id), store.blob_path(&two.id));
+
+        // Restoring one must not strand the other.
+        store.restore(&one.id, None).expect("restore first");
+        assert!(
+            first.exists(),
+            "the first sample goes back where it came from"
+        );
+        assert!(
+            store.blob_path(&two.id).exists(),
+            "the shared blob must survive while another record still needs it"
+        );
+
+        store.restore(&two.id, None).expect("restore second");
+        assert!(
+            second.exists(),
+            "the second sample goes back to its own path"
+        );
+        assert!(
+            !store.blob_path(&two.id).exists(),
+            "the last record out removes the blob"
+        );
+        assert!(store.list().is_empty());
     }
 
     #[test]

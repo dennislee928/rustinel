@@ -372,6 +372,10 @@ pub mod mapping {
             process_start_key: process_start_key(event.pid, event.process_start_time),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(bytes_to_string(&event.image)),
                 image_source: None,
                 image_truncated: (event.image_truncated != 0).then_some(true),
@@ -471,6 +475,7 @@ pub mod mapping {
             process_start_key: process_start_key(event.pid, event.process_start_time),
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 path_truncated: truncation_marker(event.flags, source_filename.is_some())
                     .map(str::to_string),
                 source_filename,

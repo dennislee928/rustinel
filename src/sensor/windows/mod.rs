@@ -10,5 +10,5 @@ mod registry_paths;
 mod registry_rundown;
 mod registry_value_data;
 
-pub(crate) use enrichment::enrich_event;
+pub(crate) use enrichment::Enricher;
 pub use etw::EtwSensor;

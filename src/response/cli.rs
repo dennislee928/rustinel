@@ -76,7 +76,7 @@ fn status(config: &AppConfig, store: &QuarantineStore) -> Result<i32> {
     );
 
     println!("\nNetwork containment");
-    match wfp::installed_filter_count() {
+    match crate::response::executor::installed_containment_count() {
         Ok(0) => println!("  filters:     none installed"),
         Ok(count) => println!("  filters:     {count} installed; this host is contained"),
         Err(error) => println!("  filters:     unavailable ({error})"),
@@ -151,10 +151,9 @@ fn isolate(config: &AppConfig, yes: bool) -> Result<i32> {
         return Ok(1);
     }
 
-    let executor = wfp::WfpExecutor::new(policy, isolation.persistent);
-    match executor.isolate_now() {
+    match crate::response::executor::isolate_now(policy, isolation.persistent) {
         Ok(count) => {
-            println!("Isolated: {count} filters installed.");
+            println!("Isolated: {count} filter rules installed.");
             println!("Lift with: rustinel response unisolate");
             Ok(0)
         }
@@ -166,13 +165,13 @@ fn isolate(config: &AppConfig, yes: bool) -> Result<i32> {
 }
 
 fn unisolate() -> Result<i32> {
-    match wfp::unisolate() {
+    match crate::response::executor::lift_containment() {
         Ok(0) => {
             println!("Nothing to remove; this host is not contained by Rustinel.");
             Ok(0)
         }
         Ok(count) => {
-            println!("Removed {count} filters. Network access is restored.");
+            println!("Removed {count} filter rules. Network access is restored.");
             Ok(0)
         }
         Err(error) => {

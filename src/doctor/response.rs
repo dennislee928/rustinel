@@ -11,7 +11,7 @@
 
 use super::inspect::DiagnosticResult;
 use crate::config::ResponseConfig;
-use crate::response::executor::wfp;
+use crate::response::executor::{driver, wfp};
 use std::path::Path;
 
 /// Report on whether the configured response actions can run.
@@ -20,11 +20,12 @@ pub fn response_results(response: &ResponseConfig) -> Vec<DiagnosticResult> {
 
     results.extend(isolation_results(response));
     results.extend(quarantine_results(response));
+    results.extend(driver_results());
 
     // Anything currently contained is worth saying out loud, whether or not
     // response is enabled now: filters installed by an earlier run outlive the
     // configuration that installed them.
-    match wfp::installed_filter_count() {
+    match crate::response::executor::installed_containment_count() {
         Ok(0) => {}
         Ok(count) => results.push(
             DiagnosticResult::warn(
@@ -48,6 +49,87 @@ pub fn response_results(response: &ResponseConfig) -> Vec<DiagnosticResult> {
     }
 
     results
+}
+
+/// What the kernel driver is actually enforcing, if one is loaded.
+///
+/// Silent when no driver is present, which is the normal case: the driver is
+/// optional and not shipped, so reporting its absence on every machine would
+/// be noise rather than a finding.
+///
+/// When one *is* loaded, the interesting failure is a partial registration. A
+/// driver whose image was not linked `/INTEGRITYCHECK` loads and runs, and
+/// `ObRegisterCallbacks` alone refuses it, so the machine ends up policing
+/// registry writes and file operations while leaving handle opens against
+/// `lsass` untouched. That looks identical to a working driver from the
+/// outside, which is exactly the kind of thing this report exists to catch.
+fn driver_results() -> Vec<DiagnosticResult> {
+    let executor = driver::KernelDriverExecutor::new();
+    if !executor.driver_present() {
+        return Vec::new();
+    }
+
+    let state = match executor.query_state() {
+        Ok(state) => state,
+        Err(error) => {
+            return vec![DiagnosticResult::warn(
+                "response_driver_state",
+                "The kernel driver is loaded but did not answer",
+                error,
+            )];
+        }
+    };
+
+    if state.version != driver::POLICY_VERSION {
+        return vec![DiagnosticResult::warn(
+            "response_driver_state",
+            format!(
+                "The kernel driver speaks policy version {}, the agent speaks {}",
+                state.version,
+                driver::POLICY_VERSION
+            ),
+            "The driver refuses a policy whose version it does not recognise, so nothing \
+             is being denied in kernel mode.",
+        )
+        .with_fix("Install the driver built from this release")];
+    }
+
+    let inactive: Vec<&str> = [
+        (state.object_callbacks_active, "handle opens"),
+        (state.registry_callback_active, "registry writes"),
+        (state.minifilter_active, "file operations"),
+    ]
+    .iter()
+    .filter(|(active, _)| !active)
+    .map(|(_, what)| *what)
+    .collect();
+
+    if !inactive.is_empty() {
+        return vec![DiagnosticResult::warn(
+            "response_driver_state",
+            format!(
+                "The kernel driver is loaded but is not policing {}",
+                inactive.join(", ")
+            ),
+            "A callback that failed to register denies nothing, and the driver keeps \
+             running. Object callbacks in particular refuse an image that was not linked \
+             with /INTEGRITYCHECK.",
+        )
+        .with_fix("See driver/README.md for the signing and linker requirements")];
+    }
+
+    vec![DiagnosticResult::pass(
+        "response_driver_state",
+        format!(
+            "The kernel driver is policing handle opens, registry writes, and file \
+             operations ({} stripped, {} denied, {} registry writes denied, {} file \
+             operations denied since load)",
+            state.handles_stripped,
+            state.handles_denied,
+            state.registry_writes_denied,
+            state.file_operations_denied
+        ),
+    )]
 }
 
 /// Whether any action needing the filtering engine is switched on.
@@ -122,7 +204,7 @@ fn isolation_results(response: &ResponseConfig) -> Vec<DiagnosticResult> {
 
     // The engine itself. Every filtering operation goes through it, and it
     // needs both the Base Filtering Engine service and administrator rights.
-    match wfp::installed_filter_count() {
+    match crate::response::executor::installed_containment_count() {
         Ok(_) => results.push(DiagnosticResult::pass(
             "response_filtering_engine",
             "The Windows Filtering Platform is reachable",

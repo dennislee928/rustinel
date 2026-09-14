@@ -603,6 +603,10 @@ fn build_process_event(ev: &ProcessEvent) -> Option<SensorEvent> {
                 process_start_key: process_start_key(ev.pid, ev.process_start_time),
                 parent_process_start_key: None,
                 payload: SensorPayload::Process(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(image),
                     image_source: Some(image_source.to_string()),
                     image_truncated: image_truncated.then_some(true),
@@ -653,6 +657,10 @@ fn build_process_event(ev: &ProcessEvent) -> Option<SensorEvent> {
             process_start_key: process_start_key(ev.pid, ev.process_start_time),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: None,
                 image_source: None,
                 image_truncated: None,
@@ -808,6 +816,7 @@ fn build_file_event(
         process_start_key: process_start_key(ev.pid, ev.process_start_time),
         parent_process_start_key: None,
         payload: SensorPayload::File(FileEventFields {
+            persistence_mechanism: None,
             source_filename,
             target_filename: Some(target_filename),
             process_id: Some(ev.pid.to_string()),
