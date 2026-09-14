@@ -930,6 +930,7 @@ pub(super) fn decode_process_access(
     }
 
     let fields = ProcessAccessFields {
+        access_method: None,
         source_process_id: Some(source_pid.to_string()),
         source_image: None,
         target_process_id: Some(target_pid.to_string()),

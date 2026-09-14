@@ -268,9 +268,14 @@ impl Engine {
                 LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_delete")),
                 LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_rename")),
                 LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("dns_query")),
+                // `sys_enter_ptrace` is attached, so rules about one process
+                // reading another have a live collector rather than loading
+                // inert. Linux has no equivalent of a remote thread creation,
+                // so `create_remote_thread` stays absent here.
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("process_access")),
             ],
-            // macOS telemetry comes from ESF (process, file) and /dev/bpf
-            // (network, DNS); mirror the Linux collector coverage.
+            // macOS telemetry comes from ESF (process, file, cross-process)
+            // and /dev/bpf (network, DNS).
             Platform::MacOS => vec![
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("process_creation")),
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("network_connection")),
@@ -279,6 +284,15 @@ impl Engine {
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("file_delete")),
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("file_rename")),
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("dns_query")),
+                // ESF subscribes to trace, get_task, get_task_read, and
+                // remote_thread_create, so rules for these have a live
+                // collector behind them rather than loading inert.
+                LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("process_access")),
+                LogSourceKey::from_parts(
+                    Some("macos"),
+                    Some("sysmon"),
+                    Some("create_remote_thread"),
+                ),
             ],
             Platform::Windows => vec![
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("process_creation")),

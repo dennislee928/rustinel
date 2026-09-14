@@ -457,6 +457,16 @@ pub struct ProcessAccessFields {
     #[serde(rename = "GrantedAccess", skip_serializing_if = "Option::is_none")]
     pub granted_access: Option<String>,
 
+    /// How the access was obtained, where naming it says more than a mask.
+    ///
+    /// Windows leaves this empty: `GrantedAccess` is the answer there, and a
+    /// handle open is a handle open. macOS has no access mask and several
+    /// distinct primitives — `ptrace`, `task_for_pid`, a task *read* port —
+    /// which differ enough in what they permit that collapsing them into one
+    /// "process access" event would lose the distinction a rule needs.
+    #[serde(rename = "AccessMethod", skip_serializing_if = "Option::is_none")]
+    pub access_method: Option<String>,
+
     /// Thread ID, when the access was to a thread rather than a process.
     #[serde(rename = "TargetThreadId", skip_serializing_if = "Option::is_none")]
     pub target_thread_id: Option<String>,

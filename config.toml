@@ -108,8 +108,13 @@ enabled = false             # freeze for triage instead of killing
 [response.actions.quarantine_file]
 enabled = false             # move a file out of reach, reversibly
 
-# Windows only. These undo persistence after it is written; a kernel driver
-# would refuse the write instead. See docs/active-response.md.
+# These undo persistence after it is written; a kernel driver would refuse the
+# write instead. See docs/active-response.md.
+#
+# revert_registry and disable_scheduled_task are Windows only. disable_service
+# covers the Windows service control manager, systemd, and launchd - on macOS it
+# is the action that answers a LaunchAgent, because killing what one started
+# only makes launchd start it again.
 [response.actions.revert_registry]
 enabled = false
 [response.actions.disable_service]
@@ -117,14 +122,16 @@ enabled = false
 [response.actions.disable_scheduled_task]
 enabled = false
 
-# Windows only, and the only actions the kernel enforces: a WFP filter is
-# installed from user mode but evaluated in the kernel on every connection.
+# Windows only: blocking one image's traffic needs a per-executable match, which
+# WFP has as ALE_APP_ID and neither nftables nor pf offers.
 [response.actions.block_process_network]
 enabled = false
 
 # Host isolation can strand a machine that is only reachable over the network
 # it just lost, so it refuses to run until something below says what must keep
-# working.
+# working. Enforced by the kernel on all three platforms: WFP on Windows,
+# nftables on Linux, pf on macOS. `persistent` is Windows only - neither Unix
+# backend has an equivalent, so a reboot there restores network access.
 [response.actions.isolate_host]
 enabled = false
 persistent = true           # survive a reboot; fails closed
@@ -163,8 +170,12 @@ max_entries = 65536 # maximum process records retained when exit events are miss
 # cache is keyed by file identity and a machine runs the same few binaries over
 # and over. The size limit bounds the first-touch cost, since there is no
 # backpressure behind this thread - anything queued behind a slow hash is shed
-# rather than delayed. Windows only today.
-hash_images = true
+# rather than delayed.
+#
+# Signature fields (Signed, Signature, SignatureStatus) come with it where the
+# platform has an answer: Authenticode on Windows, the kernel's own code-signing
+# verdict on macOS. Linux has no equivalent, so those stay empty there.
+hash_images = true              # Windows, Linux, and macOS
 hash_max_file_size_mb = 64
 
 # 6. Behavioral Recording (rustinel capture)

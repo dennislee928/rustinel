@@ -10,10 +10,31 @@ pub(crate) mod dns;
 mod integrity_level;
 #[cfg(target_os = "linux")]
 pub mod linux;
+// The eBPF wire format compiled for tests on every platform, not just Linux.
+//
+// `linux/events.rs` gates only its conversion half; the structs and the layout
+// assertions beside them are plain data and were written to build anywhere.
+// They could not, because `linux` as a whole needs aya and the compiled eBPF
+// object, so the assertions that guard a kernel-to-userspace ABI only ever ran
+// on one runner — which is the runner that would already have shipped the
+// mismatch. This alias builds those assertions here too.
+//
+// Dead-code is allowed because only the data half is built here: the consumers
+// of these constants live in the conversion module, which stays Linux-gated.
+#[cfg(all(not(target_os = "linux"), test))]
+#[path = "linux/events.rs"]
+#[allow(dead_code)]
+pub(crate) mod linux_events;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(any(windows, test))]
 mod network_events;
+// Same reason as `persistence` below: plain data assembly, so it is built and
+// tested on every platform rather than only on a macOS runner.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod cross_process;
+/// Post-sensor enrichment, on every platform that has a sensor.
+pub(crate) mod enrichment;
 // Compiled for tests everywhere, like `integrity_level`: the logic is pure
 // path handling, and a classifier only exercised on a macOS runner is one
 // whose evasion cases nobody runs.

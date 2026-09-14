@@ -29,6 +29,10 @@ use endpoint_sec::{
     EventRenameDestinationFile, EventUnlink, Message, Process,
 };
 use endpoint_sec_sys::{es_event_type_t, NewClientError};
+
+use crate::sensor::cross_process::{
+    is_cross_process, process_access_event, remote_thread_event, AccessMethod, RawCrossProcess,
+};
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
@@ -54,6 +58,15 @@ const SUBSCRIPTIONS: &[es_event_type_t] = &[
     es_event_type_t::ES_EVENT_TYPE_NOTIFY_UNLINK,
     es_event_type_t::ES_EVENT_TYPE_NOTIFY_RENAME,
     es_event_type_t::ES_EVENT_TYPE_NOTIFY_CLOSE,
+    // One process reaching into another: the shape of both credential theft
+    // and code injection, and the largest thing the macOS sensor could not
+    // see. `task_for_pid` is the macOS equivalent of opening a handle to
+    // `lsass`; `ptrace` is a separate primitive with its own restrictions;
+    // a remote thread is injection that has already succeeded.
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_TRACE,
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_GET_TASK,
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_GET_TASK_READ,
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_REMOTE_THREAD_CREATE,
 ];
 
 /// macOS Endpoint Security sensor. Implements [`Sensor`].
@@ -229,8 +242,61 @@ fn build_sensor_event(msg: &Message) -> Option<SensorEvent> {
         Event::NotifyUnlink(unlink) => build_unlink_event(msg, &unlink),
         Event::NotifyRename(rename) => build_rename_event(msg, &rename),
         Event::NotifyClose(close) => build_close_event(msg, &close),
+        Event::NotifyTrace(trace) => {
+            build_cross_process(msg, &trace.target(), Some(AccessMethod::Ptrace))
+        }
+        Event::NotifyGetTask(task) => {
+            build_cross_process(msg, &task.target(), Some(AccessMethod::TaskForPid))
+        }
+        Event::NotifyGetTaskRead(task) => {
+            build_cross_process(msg, &task.target(), Some(AccessMethod::TaskRead))
+        }
+        Event::NotifyRemoteThreadCreate(remote) => build_cross_process(msg, &remote.target(), None),
         _ => None,
     }
+}
+
+/// Assemble a cross-process event from the acting process and its target.
+///
+/// `method` distinguishes the process-access primitives; `None` means this was
+/// a remote thread creation, which is a different event class rather than
+/// another way of obtaining access.
+///
+/// Self-access is dropped here rather than in the classifier: a process
+/// inspecting or remapping itself is ordinary, and it is the overwhelming
+/// majority of these events.
+fn build_cross_process(
+    msg: &Message,
+    target: &Process<'_>,
+    method: Option<AccessMethod>,
+) -> Option<SensorEvent> {
+    let (source_pid, source_image, user, process_start_key) = actor(msg);
+    let target_pid = target.audit_token().pid() as u32;
+
+    if !is_cross_process(source_pid, target_pid) {
+        return None;
+    }
+
+    let raw = RawCrossProcess {
+        platform: Platform::MacOS,
+        provider: "esf",
+        source_pid,
+        source_image,
+        target_pid,
+        target_image: {
+            let path = osstr_to_string(target.executable().path());
+            (!path.is_empty()).then_some(path)
+        },
+        user: Some(user),
+        event_time: msg.time(),
+        source_seq: msg.global_seq_num(),
+        process_start_key,
+    };
+
+    Some(match method {
+        Some(method) => process_access_event(raw, method),
+        None => remote_thread_event(raw),
+    })
 }
 
 /// Plain, FFI-free description of an exec, extracted from an ESF event.
@@ -665,7 +731,7 @@ fn file_event(raw: RawFile) -> Option<SensorEvent> {
     // `LaunchAgents` is how persistence is usually installed, because staging
     // the plist elsewhere and moving it in is both atomic and quieter than
     // writing it in place.
-    let persistence = crate::sensor::persistence::classify(&raw.target)
+    let persistence = crate::sensor::persistence::classify_for(Platform::MacOS, &raw.target)
         .map(|mechanism| mechanism.as_str().to_string());
 
     Some(SensorEvent {

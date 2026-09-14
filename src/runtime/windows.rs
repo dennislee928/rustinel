@@ -362,7 +362,7 @@ async fn run_edr(
         // One enricher per worker thread. It owns the hash cache, which is
         // what makes hashing every process start affordable: a machine runs
         // the same few binaries over and over, and each is read once per TTL.
-        let mut enricher = crate::sensor::windows::Enricher::new(&process_config);
+        let mut enricher = crate::sensor::enrichment::Enricher::new(&process_config);
 
         while let Some(mut event) = sensor_rx.blocking_recv() {
             // PE parsing and hashing open and read the image, so both must

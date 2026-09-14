@@ -732,6 +732,7 @@ fn process_access_alert_carries_the_target_and_the_requested_access() {
         10,
         0,
         EventFields::ProcessAccess(ProcessAccessFields {
+            access_method: None,
             source_process_id: Some("4242".to_string()),
             source_image: Some(r"C:\tmp\dumper.exe".to_string()),
             target_process_id: Some("1000".to_string()),
@@ -796,6 +797,7 @@ fn cross_process_alerts_resolve_the_generic_field_names_to_the_source() {
         10,
         0,
         EventFields::ProcessAccess(ProcessAccessFields {
+            access_method: None,
             source_process_id: Some("4242".to_string()),
             source_image: Some(r"C:\tmp\dumper.exe".to_string()),
             target_process_id: Some("1000".to_string()),

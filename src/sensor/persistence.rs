@@ -27,6 +27,25 @@
 //! Mechanisms the guide lists that are *not* classified here are noted at the
 //! bottom of this file, with why.
 
+/// Classify a path for the platform it came from.
+///
+/// Platform-scoped rather than one combined list: `/etc/cron.d` and
+/// `/Library/LaunchDaemons` cannot both exist meaningfully on one host, and a
+/// combined matcher would answer for paths its host could not have produced.
+pub(crate) fn classify_for(
+    platform: crate::sensor::Platform,
+    path: &str,
+) -> Option<PersistenceMechanism> {
+    match platform {
+        crate::sensor::Platform::MacOS => classify(path),
+        crate::sensor::Platform::Linux => classify_linux(path),
+        // Windows persistence is registry Run keys, services, and scheduled
+        // tasks, which arrive as their own event categories rather than as
+        // file writes, so there is nothing for a path classifier to add.
+        crate::sensor::Platform::Windows => None,
+    }
+}
+
 /// What a path's location says the write is for.
 ///
 /// The string is what a Sigma rule matches on, so these spellings are a
@@ -55,6 +74,18 @@ pub(crate) enum PersistenceMechanism {
     AtJob,
     /// An `emond` client rule.
     Emond,
+    /// A systemd unit, system-wide or per-user.
+    SystemdUnit,
+    /// A System V init script.
+    InitScript,
+    /// A shell profile or rc file that runs on login.
+    ShellProfile,
+    /// `/etc/ld.so.preload`, which injects a library into every process.
+    LdPreload,
+    /// A udev rule, which can run a program on device events.
+    UdevRule,
+    /// An SSH `authorized_keys` file.
+    AuthorizedKeys,
 }
 
 impl PersistenceMechanism {
@@ -72,8 +103,84 @@ impl PersistenceMechanism {
             Self::LoginHook => "login_hook",
             Self::AtJob => "at_job",
             Self::Emond => "emond",
+            Self::SystemdUnit => "systemd_unit",
+            Self::InitScript => "init_script",
+            Self::ShellProfile => "shell_profile",
+            Self::LdPreload => "ld_preload",
+            Self::UdevRule => "udev_rule",
+            Self::AuthorizedKeys => "authorized_keys",
         }
     }
+}
+
+/// Classify a Linux path, or `None` when it is not a persistence location.
+///
+/// Case is *not* folded here, unlike macOS: Linux filesystems are
+/// case-sensitive, so `/etc/CRON.D` is a different path from `/etc/cron.d` and
+/// treating them as the same would classify a file that has nothing to do with
+/// cron.
+pub(crate) fn classify_linux(path: &str) -> Option<PersistenceMechanism> {
+    if path.is_empty() {
+        return None;
+    }
+
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let has = |name: &str| segments.contains(&name);
+    let last = segments.last().copied().unwrap_or_default();
+
+    // Every process on the host loads what this names, so it is the single
+    // most valuable write on the list.
+    if path == "/etc/ld.so.preload" {
+        return Some(PersistenceMechanism::LdPreload);
+    }
+    if has("systemd") && (has("system") || has("user")) {
+        return Some(PersistenceMechanism::SystemdUnit);
+    }
+    if last.ends_with(".service") || last.ends_with(".timer") {
+        return Some(PersistenceMechanism::SystemdUnit);
+    }
+    if has("cron.d")
+        || has("cron.daily")
+        || has("cron.hourly")
+        || has("cron.weekly")
+        || has("cron.monthly")
+        || last == "crontab"
+        || (has("spool") && has("cron"))
+    {
+        return Some(PersistenceMechanism::Cron);
+    }
+    if has("init.d") || last == "rc.local" {
+        return Some(PersistenceMechanism::InitScript);
+    }
+    if has("udev") && has("rules.d") {
+        return Some(PersistenceMechanism::UdevRule);
+    }
+    if last == "authorized_keys" || last == "authorized_keys2" {
+        return Some(PersistenceMechanism::AuthorizedKeys);
+    }
+    // Login shells run these, so a line appended to one persists for that user.
+    if matches!(
+        last,
+        ".bashrc"
+            | ".bash_profile"
+            | ".bash_login"
+            | ".bash_logout"
+            | ".profile"
+            | ".zshrc"
+            | ".zshenv"
+            | ".zprofile"
+            | ".zlogin"
+    ) {
+        return Some(PersistenceMechanism::ShellProfile);
+    }
+    if (has("profile.d") && has("etc")) || path == "/etc/profile" || path == "/etc/bash.bashrc" {
+        return Some(PersistenceMechanism::ShellProfile);
+    }
+
+    None
 }
 
 /// Classify a path, or `None` when it is not a persistence location.
@@ -281,6 +388,87 @@ mod tests {
         assert_eq!(classify("/"), None);
     }
 
+    /// Every process on the host loads what this file names, which makes it
+    /// the single most valuable write on the Linux list.
+    #[test]
+    fn ld_so_preload_is_recognised() {
+        assert_eq!(
+            classify_linux("/etc/ld.so.preload"),
+            Some(PersistenceMechanism::LdPreload)
+        );
+    }
+
+    #[test]
+    fn the_linux_mechanisms_are_recognised() {
+        for (path, expected) in [
+            (
+                "/etc/systemd/system/evil.service",
+                PersistenceMechanism::SystemdUnit,
+            ),
+            (
+                "/home/alice/.config/systemd/user/evil.service",
+                PersistenceMechanism::SystemdUnit,
+            ),
+            ("/etc/cron.d/evil", PersistenceMechanism::Cron),
+            ("/var/spool/cron/crontabs/alice", PersistenceMechanism::Cron),
+            ("/etc/init.d/evil", PersistenceMechanism::InitScript),
+            ("/etc/rc.local", PersistenceMechanism::InitScript),
+            (
+                "/etc/udev/rules.d/99-evil.rules",
+                PersistenceMechanism::UdevRule,
+            ),
+            (
+                "/home/alice/.ssh/authorized_keys",
+                PersistenceMechanism::AuthorizedKeys,
+            ),
+            ("/home/alice/.bashrc", PersistenceMechanism::ShellProfile),
+            ("/etc/profile.d/evil.sh", PersistenceMechanism::ShellProfile),
+        ] {
+            assert_eq!(classify_linux(path), Some(expected), "for {path}");
+        }
+    }
+
+    /// Linux filesystems are case-sensitive, so folding case here would
+    /// classify a path that is genuinely a different file. This is the
+    /// opposite of the macOS rule, and deliberately so.
+    #[test]
+    fn linux_case_is_not_folded_because_the_filesystem_does_not_fold_it() {
+        assert_eq!(classify_linux("/etc/CRON.D/evil"), None);
+        assert_eq!(
+            classify_linux("/etc/cron.d/evil"),
+            Some(PersistenceMechanism::Cron)
+        );
+    }
+
+    #[test]
+    fn ordinary_linux_paths_are_left_alone() {
+        assert_eq!(classify_linux("/home/alice/notes.txt"), None);
+        assert_eq!(classify_linux("/usr/bin/curl"), None);
+        assert_eq!(classify_linux("/tmp/ld.so.preload"), None);
+    }
+
+    /// A host only produces paths its own platform has, so asking the wrong
+    /// matcher would answer for a file that could not exist there.
+    #[test]
+    fn each_platform_is_classified_by_its_own_list() {
+        use crate::sensor::Platform;
+
+        assert_eq!(
+            classify_for(Platform::MacOS, "/Library/LaunchDaemons/x.plist"),
+            Some(PersistenceMechanism::LaunchDaemon)
+        );
+        assert_eq!(
+            classify_for(Platform::Linux, "/etc/systemd/system/x.service"),
+            Some(PersistenceMechanism::SystemdUnit)
+        );
+        // Windows persistence arrives as registry and service events, not as
+        // file writes, so there is nothing here to add.
+        assert_eq!(
+            classify_for(Platform::Windows, r"C:\Windows\System32\evil.exe"),
+            None
+        );
+    }
+
     /// The spellings are what rules match on, so they are pinned.
     #[test]
     fn the_reported_names_are_stable() {
@@ -288,5 +476,11 @@ mod tests {
         assert_eq!(PersistenceMechanism::LaunchDaemon.as_str(), "launch_daemon");
         assert_eq!(PersistenceMechanism::LoginItem.as_str(), "login_item");
         assert_eq!(PersistenceMechanism::Emond.as_str(), "emond");
+        assert_eq!(PersistenceMechanism::SystemdUnit.as_str(), "systemd_unit");
+        assert_eq!(PersistenceMechanism::LdPreload.as_str(), "ld_preload");
+        assert_eq!(
+            PersistenceMechanism::AuthorizedKeys.as_str(),
+            "authorized_keys"
+        );
     }
 }

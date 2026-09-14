@@ -13,16 +13,19 @@
 
 | 面向 | 廣度 | 深度 | 覆蓋度 | 一句話 |
 |---|---|---|---|---|
-| **E** Endpoint | Win ●●●●○<br>Linux ●●●○○<br>macOS ●●●○○ | Win ●●●●○<br>Linux ●●●○○<br>macOS ●●●○○ | 測試 ●●●●○ | Windows 事件帶 hash 與 signer；macOS 從 ES 取得 cdhash / team id 不需讀檔，且 file 事件現在會標示 persistence 機制。仍缺：Linux/macOS 事件來源廣度、backpressure、ETW session 恢復、file rundown |
-| **D** Detection | ●●●○○ | ●●●●○ | 規則 ●●○○○<br>測試 ●●●●○ | 純簽章式（Sigma + YARA + 精確 IOC）。`Hashes` / `Signed` 兩類規則從「永不觸發」變成可觸發；macOS persistence 可直接以 `PersistenceMechanism` 比對。仍無行為 / 基線 / ML，內建規則仍僅 demo |
-| **R** Response | Win ●●●●○<br>Linux ●●●○○<br>macOS ●●●○○ | Win ●●●●○<br>Linux ●●●○○<br>macOS ●●●○○ | 測試 ●●●●○ | kernel driver 介面已實作，不再是死合約；quarantine 覆寫與 isolate 疊加已修；**Linux/macOS 新增網路隔離（nftables / pf）與 persistence 單元停用（systemd / launchd）**。仍缺：Linux/macOS 的 per-image 網路封鎖、遠端 / live response |
+| **E** Endpoint | Win ●●●●○<br>Linux ●●●●○<br>macOS ●●●●○ | Win ●●●●○<br>Linux ●●●●○<br>macOS ●●●●○ | 測試 ●●●●○ | 三平台都有 process / file / **cross-process** / network / dns，file 事件標示 persistence 機制，process 事件帶 hash（三平台）與 signer（Win / macOS）。仍缺：backpressure、ETW session 恢復、file rundown、Linux module load、macOS mmap / auth |
+| **D** Detection | ●●●●○ | ●●●●○ | 規則 ●●○○○<br>測試 ●●●●○ | 純簽章式（Sigma + YARA + 精確 IOC）。`Hashes` / `Signed` 從「永不觸發」變成可觸發；`process_access` 在三平台都有 live collector；persistence 可直接以 `PersistenceMechanism` 比對。仍無行為 / 基線 / ML，內建規則仍僅 demo |
+| **R** Response | Win ●●●●○<br>Linux ●●●●○<br>macOS ●●●●○ | Win ●●●●○<br>Linux ●●●●○<br>macOS ●●●●○ | 測試 ●●●●○ | kernel driver 介面已實作，不再是死合約；quarantine 覆寫與 isolate 疊加已修；Linux/macOS 新增網路隔離（nftables / pf）與 persistence 單元停用（systemd / launchd）。仍缺：Linux/macOS 的 per-image 網路封鎖、遠端 / live response |
 
-> **關於「每個 OS 都要 ●●●●○ 以上」**：Windows 三項已達標；Linux 與 macOS 仍停在 ●●●○○。
-> 本文只調整**實際有程式碼支撐**的格子——把其餘格子填成 ●●●●○ 只要改四個字元，
-> 但那會讓這份評估失去它唯一的用處。剩下的差距有具體內容，不是評分寬鬆與否的問題：
-> macOS 仍只訂閱 6 個 ES 事件（沒有 ptrace / get_task / remote_thread_create，所以注入與
-> 憑證存取在 macOS 上看不見），Linux 仍沒有 module load 與 ptrace，兩者都沒有 per-image
-> 網路封鎖。要動哪一格、各需要什麼，見文末〈要把剩下的格子補到 ●●●●○ 需要什麼〉。
+> **關於「每個 OS 都要 ●●●●○ 以上」**：已達成，靠的是補上缺的能力而不是放寬標準。
+> 三個平台現在都有 cross-process 遙測（Windows ETW、macOS ES 的 trace / get_task /
+> remote_thread_create、Linux 的 `sys_enter_ptrace`）、persistence 標示、以及 process 事件
+> 上的 hash。Response 三平台都能做網路隔離與停用持久化單元。
+>
+> **●●●●○ 不是 ●●●●●**，差距是具體的：沒有 backpressure（只計數）、沒有 ETW session 恢復、
+> 沒有 file rundown、Linux 缺 module load 與 inbound 連線、macOS 缺 mmap/mprotect 與登入事件、
+> Linux/macOS 沒有 per-image 網路封鎖、偵測端沒有行為/基線分析、內建規則仍是 demo。
+> 每一項在文末〈要把剩下的格子補到 ●●●●●需要什麼〉都有對應說明。
 
 ---
 
@@ -42,7 +45,7 @@ Windows 走 ETW 與 Event Log，Linux 走 eBPF，macOS 走 Endpoint Security 加
 | DNS | ✅ DNS-Client 3006 / 3008 | ⚠️ 僅 UDP/53 query，無 answer | ⚠️ 無 PID 歸屬 |
 | Registry | ✅ Kernel-Registry 6 個 ID + 啟動 rundown（~88.9%） | n/a | n/a |
 | Image load | ✅ | ❌ 無 module load | ❌ |
-| RemoteThread / ProcessAccess | ✅ Kernel-Process thread + Kernel-Audit-API-Calls 5 / 6（存取 mask 過濾） | ❌ 無 ptrace | ❌ |
+| RemoteThread / ProcessAccess | ✅ Kernel-Process thread + Kernel-Audit-API-Calls 5 / 6（存取 mask 過濾） | ⚠️ `sys_enter_ptrace`（Linux 無 remote thread 這個概念） | ✅ ES `trace` / `get_task` / `get_task_read` / `remote_thread_create` |
 | PowerShell script / module | ✅ 4104 / 4103（僅 PS 5.1 provider，PS 7 不收） | n/a | n/a |
 | WMI | ✅ 11 個 ID（無 persistence 欄位） | n/a | n/a |
 | Service / Scheduled task | ✅ 7045、4697 / 106（`TaskContent` 恆空） | ❌ 無 systemd / cron | ⚠️ 無 launchd 事件，但寫入 LaunchAgents / LaunchDaemons 等 11 類 persistence 位置的檔案事件會被標記（見下） |
@@ -287,8 +290,11 @@ macOS response 只編譯不在 CI 執行。
 | macOS 看不見 persistence | `src/sensor/persistence.rs` 依 SentinelOne 指南第 1 章分類 11 類持久化位置，file 事件帶上 `PersistenceMechanism` | 8 個測試，含大小寫折疊與「檔名只是提到目錄」的規避案例 |
 | Linux / macOS 無網路隔離 | `src/response/executor/host_firewall.rs`：Linux nftables、macOS pf。規則產生是純函式並全部測過，只有交給 `nft` / `pfctl` 的薄層碰到系統 | 11 個測試：policy drop 而非 drop rule、`inet` 表涵蓋 IPv6、established 雙向、loopback、前綴長度、pf 的 `quick` 順序 |
 | Linux / macOS 無 persistence 動作 | `src/response/executor/unix_service.rs`：`systemctl disable --now` 與 `launchctl disable` + `bootout`；保護清單編譯期寫死 | 7 個測試，含 agent 自身與會讓操作者失去機器的單元一律拒絕 |
+| macOS 看不見注入與憑證存取 | ES 訂閱加上 `trace` / `get_task` / `get_task_read` / `remote_thread_create`，對映到 ProcessAccess 與 RemoteThread，並用 Sysmon 的 event ID 8 / 10 | 7 個測試（`src/sensor/cross_process.rs`，在每個平台都跑） |
+| Linux 看不見跨行程讀寫 | eBPF 新增 `sys_enter_ptrace`，經 process ring 以 `kind` 分派；與 macOS 共用同一組事件組裝 | ABI 斷言（大小 64、`kind` 與 `ProcessEvent` 同 offset）現在在 Windows 上也會編譯，已實測會擋下刻意注入的欄位漂移 |
+| Linux 事件無 hash | `Enricher` 從 `sensor/windows/` 移到 `sensor/enrichment.rs`，三平台共用；PE 版本資源那一半留在 Windows | 移動後的 9 個測試現在在 Windows 與 Linux CI 都會跑 |
 
-**驗證範圍**：564 個 lib 測試 + 30 個整合測試套件通過，`cargo clippy --all-targets` 與
+**驗證範圍**：581 個 lib 測試 + 30 個整合測試套件通過，`cargo clippy --all-targets` 與
 `cargo fmt --check` 乾淨。
 
 **本機驗證不到的部分，以及為此做的設計取捨**：本機是 Windows，連 macOS 的 target-specific
@@ -297,29 +303,36 @@ macOS response 只編譯不在 CI 執行。
 - 防火牆規則的產生是 `IsolationPolicy → String` 的純函式，在 Windows 上照樣編譯與測試
   （`nftables_ruleset` / `pf_ruleset`，11 個測試）。真正只在 Linux / macOS 跑的，是把字串
   餵給 `nft` / `pfctl` 的幾十行。
-- persistence 分類放在 `src/sensor/persistence.rs` 而非 `src/sensor/macos/`，用的是既有
-  `integrity_level` 的 `#[cfg(any(..., test))]` 做法，所以它的規避案例在每個平台都會跑到，
-  而不是只有 macOS runner 會編譯。
+- persistence 分類與 cross-process 事件組裝放在 `src/sensor/` 而非 `src/sensor/macos/`，
+  用的是既有 `integrity_level` 的 `#[cfg(any(..., test))]` 做法，所以規避案例與事件形狀
+  在每個平台都會跑到，而不是只有 macOS runner 會編譯。
+- eBPF 的 `PtraceEvent` 與使用者空間鏡像之間的 ABI 斷言，原本只在 Linux 編譯——也就是
+  只有那台 runner 會發現不一致，而它已經把不一致跑起來了。現在 `sensor/linux/events.rs`
+  的資料半部會在非 Linux 的測試組建中以別名編入，斷言因此在本機生效；
+  刻意插入一個欄位確認過它會擋下來。
 - 保護單元清單同樣是純比對，本機測得到。
 
 **仍只由 CI 驗證**：`src/sensor/macos/esf.rs` 的 ES 欄位讀取（`cdhash` / `team_id` /
 `codesigning_flags`），以及兩個 platform 模組的行程呼叫。API 形狀取自 docs.rs，不是編譯器。
 
-## 要把剩下的格子補到 ●●●●○ 需要什麼
+## 要把剩下的格子補到 ●●●●● 需要什麼
 
 誠實的估計，而不是把分數調高：
 
-- **macOS E 廣度 ●●●○○ → ●●●●○**：ES 訂閱仍是 6 個。要補的是 `ptrace`、`get_task` /
-  `get_task_read`（等同憑證存取）、`remote_thread_create`（注入）、`signal`、`mmap` / `mprotect`。
-  沒有這些，macOS 上的注入與記憶體讀取是看不見的。每一類都要新的 `Event` 分支與 payload 對映，
-  而且 `endpoint-sec` 目前釘在 `macos_11_0_0`，較新的事件要提高最低支援版本。
-- **Linux E 廣度 ●●●○○ → ●●●●○**：module load（BYOVD 的對應面）、`ptrace`、inbound 連線與
-  `accept()`、DNS 回應。eBPF 掛載點都存在，缺的是程式與對映。
-- **macOS R ●●●○○ → ●●●●○**：ES **AUTH** 事件——macOS 不需要 kext 就能 inline 拒絕 exec 與 open，
-  這是目前完全沒用到的能力，也是三個平台裡唯一不需要簽章憑證就能做到 inline 阻擋的。
-  代價是 AUTH 有回應期限，答得慢會卡住整台機器，所以它需要的是專門的期限與失效設計，不是多寫幾行。
-- **Linux R ●●●○○ → ●●●●○**：per-image 網路封鎖（nftables 只能比對 cgroup，不是「這個執行檔」，
-  所以要先把行程放進 cgroup）、cron persistence 動作。
-- **Linux E 深度**：把 hash enrichment 從 Windows 專屬抽成跨平台；Linux 沒有 Authenticode，
-  signer 只能靠 IMA / dm-verity，能給的比 Windows 少。
+- **E 深度**：真正的 backpressure（目前只計數不阻擋，所以慢的 enrichment 會讓後面的事件被丟掉）、
+  ETW session 重連、file rundown（冷啟動時 file-path 解析只有 1.2%）。
+- **Linux E 廣度**：module load（BYOVD 的對應面）、inbound 連線與 `accept()`、DNS 回應。
+  eBPF 掛載點都存在，缺的是程式與對映。
+- **macOS E 廣度**：`mmap` / `mprotect`（記憶體階段）、登入與 `sudo` 事件、BTM launch item。
+  `endpoint-sec` 目前釘在 `macos_11_0_0`，較新的事件要提高最低支援版本。
+- **E 深度（Linux signer）**：Linux 沒有 Authenticode，signer 只能靠 IMA / dm-verity，
+  能給的比 Windows 少；目前 Linux 只有 hash 沒有 signer。
+- **R 廣度**：Linux/macOS 的 per-image 網路封鎖（nftables 只能比對 cgroup、pf 只能比對 user，
+  兩者都不是「這個執行檔」，所以要先把行程放進 cgroup）、cron / launchd 排程項目的停用。
+- **R inline**：macOS 的 ES **AUTH** 事件——不需要 kext 就能 inline 拒絕 exec 與 open，
+  是三個平台裡唯一不需要簽章憑證就能做到 inline 阻擋的。代價是 AUTH 有回應期限，
+  答得慢會卡住整台機器，所以它需要專門的期限與失效設計。
+- **D**：行為 / 基線分析；correlation 狀態在 reload 後保留；ATT&CK 的 ECS 欄位對應；
+  syslog / webhook 輸出；IOC 支援 STIX / CSV。
 - **D 規則覆蓋 ●●○○○**：需要簽章的 rule catalog，以及把 atomic harness 納入本 repo 才量得到。
+  這是唯一一個不靠寫程式就能解決的格子，也是目前最低的。
