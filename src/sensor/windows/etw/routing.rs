@@ -300,10 +300,21 @@ pub(super) fn refine_registry_create_action(parser: &Parser) -> Option<()> {
     }
 }
 
+/// Kernel-Process `ThreadStart`.
+///
+/// Opcode and event ID coincide for this provider, and the routing table reads
+/// the opcode, so this is compared against `record.opcode()`.
+pub(super) const KERNEL_PROCESS_OPCODE_THREAD_START: u8 = 3;
+
+/// Kernel-Audit-API-Calls event IDs.
+pub(super) const KERNEL_AUDIT_API_EVENT_OPEN_PROCESS: u16 = 5;
+pub(super) const KERNEL_AUDIT_API_EVENT_OPEN_THREAD: u16 = 6;
+
 pub(super) struct EtwRouting {
     pub(super) kernel_process_guid: GUID,
     pub(super) kernel_file_guid: GUID,
     pub(super) kernel_registry_guid: GUID,
+    pub(super) kernel_audit_api_guid: GUID,
     pub(super) powershell_guid: GUID,
     pub(super) guid_to_category: HashMap<GUID, EventCategory>,
     /// Subscribed provider GUIDs to their manifest names. Decode failures are
@@ -334,6 +345,7 @@ impl EtwRouting {
             kernel_process_guid: EtwProviders::kernel_process().guid,
             kernel_file_guid: EtwProviders::kernel_file().guid,
             kernel_registry_guid: EtwProviders::kernel_registry().guid,
+            kernel_audit_api_guid: EtwProviders::kernel_audit_api().guid,
             powershell_guid: EtwProviders::powershell().guid,
             guid_to_category,
             guid_to_name,
@@ -361,6 +373,21 @@ impl EtwRouting {
                 1 => Some((EventCategory::Process, SensorAction::Start)),
                 2 => Some((EventCategory::Process, SensorAction::Stop)),
                 10 => Some((EventCategory::ImageLoad, SensorAction::Load)),
+                // Every thread start routes here; the decoder discards the
+                // same-process ones, which it can only tell apart once the
+                // payload names the owning process.
+                KERNEL_PROCESS_OPCODE_THREAD_START => {
+                    Some((EventCategory::RemoteThread, SensorAction::Start))
+                }
+                _ => None,
+            };
+        }
+
+        if provider_guid == self.kernel_audit_api_guid {
+            return match record.event_id() {
+                KERNEL_AUDIT_API_EVENT_OPEN_PROCESS | KERNEL_AUDIT_API_EVENT_OPEN_THREAD => {
+                    Some((EventCategory::ProcessAccess, SensorAction::Access))
+                }
                 _ => None,
             };
         }
@@ -388,6 +415,8 @@ impl EtwRouting {
             }
             EventCategory::Process
             | EventCategory::ImageLoad
+            | EventCategory::RemoteThread
+            | EventCategory::ProcessAccess
             | EventCategory::Scripting
             | EventCategory::PowerShellModule => unreachable!(),
         };
@@ -402,6 +431,22 @@ mod tests {
     use super::*;
     use crate::models::EventCategory;
     use crate::sensor::SensorAction;
+
+    #[test]
+    fn audit_api_event_ids_are_the_two_handle_opens() {
+        // Guards the constants the decoder branches on against drift with the
+        // provider scope, which is asserted separately.
+        assert_eq!(KERNEL_AUDIT_API_EVENT_OPEN_PROCESS, 5);
+        assert_eq!(KERNEL_AUDIT_API_EVENT_OPEN_THREAD, 6);
+    }
+
+    #[test]
+    fn thread_start_opcode_is_distinct_from_the_process_opcodes() {
+        // Kernel-Process routes on opcode; a collision with process start,
+        // stop, or image load would silently reclassify those events.
+        assert_eq!(KERNEL_PROCESS_OPCODE_THREAD_START, 3);
+        assert!(![1u8, 2, 10].contains(&KERNEL_PROCESS_OPCODE_THREAD_START));
+    }
 
     #[test]
     fn filter_matches_routing_allowlist() {

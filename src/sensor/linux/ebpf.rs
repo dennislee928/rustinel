@@ -35,7 +35,8 @@ use crate::utils::{lookup_username_by_uid, query_process_details};
 
 use super::events::{
     bytes_to_string, connect_result_is_connection, parse_event, system_time_from_boot_ns, DnsEvent,
-    FileEvent, FileEventHeader, FileIndexEvent, NetworkEvent, ProcessEvent,
+    FileEvent, FileEventHeader, FileIndexEvent, NetworkEvent, ProcessEvent, PtraceEvent,
+    PROCESS_EVENT_KIND_PTRACE,
 };
 use super::paths::{resolve_at_path, resolve_indexable_dir_path, truncation_marker, DirFdIndex};
 
@@ -130,6 +131,11 @@ impl Sensor for EbpfSensor {
             "syscalls",
             "sys_enter_execveat",
         )?;
+        // One process reading or writing another's memory: the Linux shape of
+        // both credential theft and injection. Optional because a kernel built
+        // without `CONFIG_FTRACE_SYSCALLS` has no syscall tracepoints at all,
+        // and losing ptrace visibility is not a reason to start no sensor.
+        attach_optional_tracepoint(&mut bpf, "handle_ptrace", "syscalls", "sys_enter_ptrace")?;
         // Entry captures the destination while the sockaddr is still readable;
         // exit is what decides whether the attempt became a connection.
         attach_tracepoint(&mut bpf, "handle_connect", "syscalls", "sys_enter_connect")?;
@@ -410,6 +416,23 @@ fn drain_process_ring(rb: &mut RingBuf<MapData>, tx: &Sender<SensorEvent>) {
     while let Some(item) = rb.next() {
         LINUX_EBPF.record_received(LinuxEbpfFamily::Process);
         let bytes: &[u8] = &item;
+
+        // The ring carries two shapes. `kind` sits at the same offset in both,
+        // so it is read before anything is transmuted: reading a 64-byte
+        // ptrace record as an 832-byte process record would run off the end of
+        // the entry.
+        if peek_process_kind(bytes) == Some(PROCESS_EVENT_KIND_PTRACE) {
+            let Some(ev) = parse_event::<PtraceEvent>(bytes) else {
+                LINUX_EBPF.record_short_read(LinuxEbpfFamily::Process);
+                warn!("process ring: short ptrace read ({} bytes)", bytes.len());
+                continue;
+            };
+            LINUX_EBPF.record_decoded(LinuxEbpfFamily::Process);
+            LINUX_EBPF.record_emitted(LinuxEbpfFamily::Process);
+            try_send(tx, build_ptrace_event(&ev));
+            continue;
+        }
+
         let Some(ev) = parse_event::<ProcessEvent>(bytes) else {
             LINUX_EBPF.record_short_read(LinuxEbpfFamily::Process);
             warn!("process ring: short read ({} bytes)", bytes.len());
@@ -577,6 +600,42 @@ fn resolve_command_line(
     }
 }
 
+/// Read the `kind` discriminator without committing to a struct.
+///
+/// Both records on this ring place `kind` at offset 16, which is what lets one
+/// reader serve both. Returns `None` for an entry too short to hold even that,
+/// which the caller treats as a short read.
+fn peek_process_kind(bytes: &[u8]) -> Option<u32> {
+    const KIND_OFFSET: usize = 16;
+    let slice = bytes.get(KIND_OFFSET..KIND_OFFSET + 4)?;
+    Some(u32::from_ne_bytes(slice.try_into().ok()?))
+}
+
+/// Turn a kernel ptrace record into a process-access event.
+///
+/// The target's executable is not resolved here. Reading `/proc/<pid>/exe`
+/// would be a syscall per event on the ring-drain path, and the process cache
+/// already carries the image for any process the sensor saw start; leaving it
+/// empty lets the normalizer fill it from there rather than racing a process
+/// that may already be gone.
+fn build_ptrace_event(ev: &PtraceEvent) -> SensorEvent {
+    crate::sensor::cross_process::process_access_event(
+        crate::sensor::cross_process::RawCrossProcess {
+            platform: Platform::Linux,
+            provider: "ebpf",
+            source_pid: ev.source_pid,
+            source_image: None,
+            target_pid: ev.target_pid,
+            target_image: None,
+            user: Some(ev.uid.to_string()),
+            event_time: system_time_from_boot_ns(ev.event_time_ns),
+            source_seq: Some(ev.source_seq),
+            process_start_key: process_start_key(ev.source_pid, ev.process_start_time),
+        },
+        crate::sensor::cross_process::AccessMethod::Ptrace,
+    )
+}
+
 fn build_process_event(ev: &ProcessEvent) -> Option<SensorEvent> {
     let user = resolved_linux_user(ev.uid);
     match ev.kind {
@@ -603,6 +662,10 @@ fn build_process_event(ev: &ProcessEvent) -> Option<SensorEvent> {
                 process_start_key: process_start_key(ev.pid, ev.process_start_time),
                 parent_process_start_key: None,
                 payload: SensorPayload::Process(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(image),
                     image_source: Some(image_source.to_string()),
                     image_truncated: image_truncated.then_some(true),
@@ -653,6 +716,10 @@ fn build_process_event(ev: &ProcessEvent) -> Option<SensorEvent> {
             process_start_key: process_start_key(ev.pid, ev.process_start_time),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: None,
                 image_source: None,
                 image_truncated: None,
@@ -808,6 +875,7 @@ fn build_file_event(
         process_start_key: process_start_key(ev.pid, ev.process_start_time),
         parent_process_start_key: None,
         payload: SensorPayload::File(FileEventFields {
+            persistence_mechanism: None,
             source_filename,
             target_filename: Some(target_filename),
             process_id: Some(ev.pid.to_string()),

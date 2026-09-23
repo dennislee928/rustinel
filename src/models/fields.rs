@@ -22,6 +22,7 @@ pub enum EventFields {
     PowerShellScript(PowerShellScriptFields),
     PowerShellModule(PowerShellModuleFields),
     RemoteThread(RemoteThreadFields),
+    ProcessAccess(ProcessAccessFields),
     WmiEvent(WmiEventFields),
     ServiceCreation(ServiceCreationFields),
     TaskCreation(TaskCreationFields),
@@ -53,6 +54,10 @@ impl EventFields {
             EventCategory::Registry => serde_json::from_value(payload).map(Self::RegistryEvent),
             EventCategory::Dns => serde_json::from_value(payload).map(Self::DnsQuery),
             EventCategory::ImageLoad => serde_json::from_value(payload).map(Self::ImageLoad),
+            EventCategory::RemoteThread => serde_json::from_value(payload).map(Self::RemoteThread),
+            EventCategory::ProcessAccess => {
+                serde_json::from_value(payload).map(Self::ProcessAccess)
+            }
             EventCategory::Scripting => serde_json::from_value(payload).map(Self::PowerShellScript),
             EventCategory::PowerShellModule => {
                 serde_json::from_value(payload).map(Self::PowerShellModule)
@@ -123,6 +128,37 @@ pub struct ProcessCreationFields {
 
     #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// Image hashes, in Sysmon's `ALGO=VALUE,ALGO=VALUE` spelling.
+    ///
+    /// Sysmon's format rather than separate fields because that is what the
+    /// public Sigma corpus matches on: rules write
+    /// `Hashes|contains: 'SHA256=...'`, so a rule referencing this field only
+    /// fires if the value is spelled the way the rule expects.
+    ///
+    /// Populated off the sensor's hot path; see
+    /// `crate::sensor::windows::enrich_event`.
+    #[serde(rename = "Hashes", skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<String>,
+
+    /// Whether the image carries a valid code signature.
+    ///
+    /// Sysmon's `Signed`. Rules written as `Signed: 'false'` are asking for an
+    /// unsigned binary in a place that should only hold signed ones, so an
+    /// absent value and `false` mean very different things: absent is "not
+    /// checked", and only `false` should fire such a rule.
+    #[serde(rename = "Signed", skip_serializing_if = "Option::is_none")]
+    pub signed: Option<String>,
+
+    /// The signing identity: the certificate subject on Windows, the team
+    /// identifier on macOS.
+    #[serde(rename = "Signature", skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+
+    /// Why a signature was or was not accepted, in Sysmon's vocabulary
+    /// (`Valid`, `Expired`, `Unsigned`, ...).
+    #[serde(rename = "SignatureStatus", skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
 }
 
 /// File event fields (Sigma: file_access, file_delete, file_event)
@@ -148,6 +184,18 @@ pub struct FileEventFields {
         skip_serializing_if = "Option::is_none"
     )]
     pub previous_creation_utc_time: Option<String>,
+
+    /// Which persistence mechanism this path belongs to, when it is one.
+    ///
+    /// Lets a rule ask for `PersistenceMechanism: launch_agent` instead of
+    /// carrying the path list itself, which every rule would otherwise have to
+    /// repeat and keep correct. macOS today; the classifier is in
+    /// `crate::sensor::persistence`.
+    #[serde(
+        rename = "PersistenceMechanism",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub persistence_mechanism: Option<String>,
 
     #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -259,6 +307,18 @@ pub struct DnsQueryFields {
 /// Image load event fields (Sigma: image_load)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageLoadFields {
+    /// Hashes of the loaded image, in Sysmon's `ALGO=VALUE` spelling.
+    ///
+    /// Same contract as `ProcessCreationFields::hashes`: the corpus matches
+    /// this field by substring, so the spelling is what makes a rule fire.
+    #[serde(rename = "Hashes", skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<String>,
+
+    /// Why a signature was or was not accepted, in Sysmon's vocabulary
+    /// (`Valid`, `Expired`, `Unsigned`, ...).
+    #[serde(rename = "SignatureStatus", skip_serializing_if = "Option::is_none")]
+    pub signature_status: Option<String>,
+
     #[serde(rename = "ImageLoaded", skip_serializing_if = "Option::is_none")]
     pub image_loaded: Option<String>,
 
@@ -364,6 +424,52 @@ pub struct RemoteThreadFields {
 
     #[serde(rename = "StartFunction", skip_serializing_if = "Option::is_none")]
     pub start_function: Option<String>,
+
+    #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Cross-process handle access fields (Sigma: process_access).
+///
+/// One process asked the object manager for a handle to another. The interesting
+/// part is `GrantedAccess`: a handle carrying `PROCESS_VM_READ` on `lsass.exe`
+/// is what credential dumping looks like from outside, and one carrying
+/// `PROCESS_VM_WRITE | PROCESS_CREATE_THREAD` is what injection looks like.
+///
+/// Windows reports the *requested* access in the ETW record, and grants at most
+/// that, so the value is an upper bound on what the caller received rather than
+/// proof it received all of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessAccessFields {
+    #[serde(rename = "SourceProcessId", skip_serializing_if = "Option::is_none")]
+    pub source_process_id: Option<String>,
+
+    #[serde(rename = "SourceImage", skip_serializing_if = "Option::is_none")]
+    pub source_image: Option<String>,
+
+    #[serde(rename = "TargetProcessId", skip_serializing_if = "Option::is_none")]
+    pub target_process_id: Option<String>,
+
+    #[serde(rename = "TargetImage", skip_serializing_if = "Option::is_none")]
+    pub target_image: Option<String>,
+
+    /// Access mask, formatted as Sysmon writes it (`0x1010`).
+    #[serde(rename = "GrantedAccess", skip_serializing_if = "Option::is_none")]
+    pub granted_access: Option<String>,
+
+    /// How the access was obtained, where naming it says more than a mask.
+    ///
+    /// Windows leaves this empty: `GrantedAccess` is the answer there, and a
+    /// handle open is a handle open. macOS has no access mask and several
+    /// distinct primitives — `ptrace`, `task_for_pid`, a task *read* port —
+    /// which differ enough in what they permit that collapsing them into one
+    /// "process access" event would lose the distinction a rule needs.
+    #[serde(rename = "AccessMethod", skip_serializing_if = "Option::is_none")]
+    pub access_method: Option<String>,
+
+    /// Thread ID, when the access was to a thread rather than a process.
+    #[serde(rename = "TargetThreadId", skip_serializing_if = "Option::is_none")]
+    pub target_thread_id: Option<String>,
 
     #[serde(rename = "User", skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,

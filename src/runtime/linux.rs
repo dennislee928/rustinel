@@ -64,7 +64,11 @@ async fn run_linux_edr(
 
     // 4. Active response engine
     let response_config = Arc::new(ArcSwap::from(Arc::new(cfg.response.clone())));
-    let (response_engine, response_worker_handle) = ResponseEngine::new(response_config.clone());
+    let (response_engine, response_worker_handle) = ResponseEngine::with_options(
+        response_config.clone(),
+        crate::response::executor::default_executor(&response_config.load()),
+        Some(alert_sink.clone()),
+    );
 
     let pipeline = LivePipeline::new(
         &cfg,
@@ -86,8 +90,15 @@ async fn run_linux_edr(
 
     let (sensor_tx, mut sensor_rx) = mpsc::channel::<SensorEvent>(8192);
     let router_for_worker = Arc::clone(&pipeline.router);
+    let process_config = cfg.process.clone();
     let sensor_worker_handle = tokio::task::spawn_blocking(move || {
-        while let Some(event) = sensor_rx.blocking_recv() {
+        // Hashing opens the image, so it happens here rather than in the eBPF
+        // ring drain, and before the router so a rule matching on `Hashes` can
+        // still see it. One enricher per worker thread owns the cache.
+        let mut enricher = crate::sensor::enrichment::Enricher::new(&process_config);
+
+        while let Some(mut event) = sensor_rx.blocking_recv() {
+            enricher.enrich(&mut event);
             router_for_worker.route_event(&event);
         }
     });

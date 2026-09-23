@@ -556,8 +556,7 @@ mod tests {
 
     #[test]
     fn sessions_partition_the_providers() {
-        // A provider dropped from both lists is silent telemetry loss, and one
-        // enabled on both is a duplicate of every event it carries.
+        // A provider dropped from both lists is silent telemetry loss.
         let mut split: Vec<&str> = EtwProviders::process_session()
             .iter()
             .chain(EtwProviders::main_session().iter())
@@ -571,12 +570,39 @@ mod tests {
         all.sort_unstable();
 
         assert_eq!(split, all, "provider split does not cover every provider");
-        let unique = {
-            let mut names = split.clone();
-            names.dedup();
-            names
-        };
-        assert_eq!(unique, split, "a provider is enabled on both sessions");
+    }
+
+    #[test]
+    fn a_provider_on_both_sessions_asks_each_for_different_events() {
+        // Kernel-Process is subscribed twice on purpose: process and image
+        // events on the low-latency session, thread events on the main one.
+        // That is only safe while the keyword masks are disjoint, because
+        // overlapping bits would deliver the same event on both sessions and
+        // double-count everything it carries.
+        let subscriptions: Vec<_> = EtwProviders::process_session()
+            .into_iter()
+            .chain(EtwProviders::main_session())
+            .collect();
+
+        for (index, first) in subscriptions.iter().enumerate() {
+            for second in subscriptions.iter().skip(index + 1) {
+                if first.guid != second.guid {
+                    continue;
+                }
+
+                assert_ne!(
+                    first.keywords, 0,
+                    "{} is subscribed twice with no keyword filter",
+                    first.name
+                );
+                assert_eq!(
+                    first.keywords & second.keywords,
+                    0,
+                    "{} is subscribed twice with overlapping keywords",
+                    first.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -585,11 +611,16 @@ mod tests {
         // write with the `OpenKey` that named its key, and that pairing only
         // holds within one session's ordering. Kernel-File has the same
         // constraint through `FilePathCache`.
-        let names: Vec<&str> = EtwProviders::process_session()
+        let process_session = EtwProviders::process_session();
+        let names: Vec<&str> = process_session
             .iter()
             .map(|provider| provider.name)
             .collect();
         assert_eq!(names, vec!["Microsoft-Windows-Kernel-Process"]);
+
+        // Specifically the process and image events, not the thread events,
+        // which are high-rate enough to defeat the point of the split.
+        assert_eq!(process_session[0].keywords, EtwProviders::PROCESS_KEYWORDS);
     }
 
     #[test]

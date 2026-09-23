@@ -99,6 +99,7 @@ pub fn build_yara_alert(
         rule_description: None,
         rule_id,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: utils::now_timestamp_string(),
             source_seq: None,
@@ -110,6 +111,10 @@ pub fn build_yara_alert(
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(path.to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -184,6 +189,7 @@ pub fn build_yara_memory_alert(
         rule_description: None,
         rule_id,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: utils::now_timestamp_string(),
             source_seq: None,
@@ -195,6 +201,10 @@ pub fn build_yara_memory_alert(
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(image.to_string()),
                 image_source: None,
                 image_truncated: None,

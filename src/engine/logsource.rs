@@ -215,6 +215,8 @@ impl Engine {
                 | "dns_query"
                 | "dns"
                 | "image_load"
+                | "create_remote_thread"
+                | "process_access"
                 | "ps_script"
                 | "ps_module"
                 | "wmi_event"
@@ -266,9 +268,14 @@ impl Engine {
                 LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_delete")),
                 LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("file_rename")),
                 LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("dns_query")),
+                // `sys_enter_ptrace` is attached, so rules about one process
+                // reading another have a live collector rather than loading
+                // inert. Linux has no equivalent of a remote thread creation,
+                // so `create_remote_thread` stays absent here.
+                LogSourceKey::from_parts(Some("linux"), Some("sysmon"), Some("process_access")),
             ],
-            // macOS telemetry comes from ESF (process, file) and /dev/bpf
-            // (network, DNS); mirror the Linux collector coverage.
+            // macOS telemetry comes from ESF (process, file, cross-process)
+            // and /dev/bpf (network, DNS).
             Platform::MacOS => vec![
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("process_creation")),
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("network_connection")),
@@ -277,6 +284,15 @@ impl Engine {
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("file_delete")),
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("file_rename")),
                 LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("dns_query")),
+                // ESF subscribes to trace, get_task, get_task_read, and
+                // remote_thread_create, so rules for these have a live
+                // collector behind them rather than loading inert.
+                LogSourceKey::from_parts(Some("macos"), Some("sysmon"), Some("process_access")),
+                LogSourceKey::from_parts(
+                    Some("macos"),
+                    Some("sysmon"),
+                    Some("create_remote_thread"),
+                ),
             ],
             Platform::Windows => vec![
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("process_creation")),
@@ -295,6 +311,12 @@ impl Engine {
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_set")),
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("registry_delete")),
                 LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("image_load")),
+                LogSourceKey::from_parts(
+                    Some("windows"),
+                    Some("sysmon"),
+                    Some("create_remote_thread"),
+                ),
+                LogSourceKey::from_parts(Some("windows"), Some("sysmon"), Some("process_access")),
                 LogSourceKey::from_parts(Some("windows"), Some("dns-client"), Some("dns_query")),
                 LogSourceKey::from_parts(Some("windows"), Some("dns"), Some("dns_query")),
                 LogSourceKey::from_parts(Some("windows"), Some("powershell"), Some("ps_script")),
@@ -587,6 +609,20 @@ impl Engine {
                     Some(platform_product(event.platform)),
                     Some("sysmon"),
                     Some("image_load"),
+                ));
+            }
+            EventCategory::RemoteThread => {
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("create_remote_thread"),
+                ));
+            }
+            EventCategory::ProcessAccess => {
+                aliases.push(LogSourceKey::from_parts(
+                    Some(platform_product(event.platform)),
+                    Some("sysmon"),
+                    Some("process_access"),
                 ));
             }
             EventCategory::Scripting => {

@@ -188,6 +188,7 @@ impl IocEngine {
             rule_description: ioc_rule_description(m),
             rule_id: Some(ioc_id),
             engine: DetectionEngine::Ioc,
+            tags: Vec::new(),
             event: event.clone(),
             match_details: None,
         }
@@ -209,6 +210,7 @@ impl IocEngine {
             rule_description: ioc_rule_description(m),
             rule_id: Some(ioc_id),
             engine: DetectionEngine::Ioc,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: crate::utils::now_timestamp_string(),
                 source_seq: None,
@@ -220,6 +222,10 @@ impl IocEngine {
                 event_id_string: "1".to_string(),
                 opcode: 1,
                 fields: EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(path.to_string()),
                     image_source: None,
                     image_truncated: None,

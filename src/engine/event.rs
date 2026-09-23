@@ -204,6 +204,10 @@ mod tests {
     #[test]
     fn typed_process_fields_expose_sigma_names() {
         let fields = ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some("/usr/bin/curl".to_string()),
             image_source: None,
             image_truncated: Some(true),

@@ -16,6 +16,13 @@ pub struct Alert {
     pub rule_id: Option<String>,
     /// Detection engine type
     pub engine: DetectionEngine,
+    /// Rule tags, as written in the Sigma rule (`attack.t1003.001`).
+    ///
+    /// Carried on the alert so the response policy can select on technique
+    /// without reaching back into the detector store, which YARA and IOC
+    /// alerts have no entry in. Empty for those two engines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Associated event data
     pub event: NormalizedEvent,
     /// Optional debug match details

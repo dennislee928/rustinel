@@ -68,6 +68,9 @@ impl Engine {
         let rule_description = self
             .store
             .description_for(result.header.rule_id.as_deref(), &result.header.rule_title);
+        let tags = self
+            .store
+            .tags_for(result.header.rule_id.as_deref(), &result.header.rule_title);
         let match_details = self.build_match_details(&result);
 
         Alert {
@@ -76,6 +79,7 @@ impl Engine {
             rule_description,
             rule_id,
             engine: DetectionEngine::Sigma,
+            tags,
             event: event.clone(),
             match_details,
         }
@@ -203,6 +207,10 @@ level: high
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(image.to_string()),
                 image_source: None,
                 image_truncated: None,

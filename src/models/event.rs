@@ -300,11 +300,30 @@ impl NormalizedEvent {
             EventFields::RemoteThread(f) => match key {
                 "SourceProcessId" => f.source_process_id.as_deref(),
                 "SourceImage" => f.source_image.as_deref(),
+                // Sigma's create_remote_thread rules read the creator as
+                // `Image` and `ProcessId` as often as they read the explicit
+                // Source* names, so both spellings resolve.
+                "Image" => f.source_image.as_deref(),
+                "ProcessId" => f.source_process_id.as_deref(),
                 "TargetProcessId" => f.target_process_id.as_deref(),
                 "TargetImage" => f.target_image.as_deref(),
                 "StartAddress" => f.start_address.as_deref(),
                 "StartModule" => f.start_module.as_deref(),
                 "StartFunction" => f.start_function.as_deref(),
+                "User" => f.user.as_deref(),
+                _ => None,
+            },
+            EventFields::ProcessAccess(f) => match key {
+                "SourceProcessId" => f.source_process_id.as_deref(),
+                "SourceImage" => f.source_image.as_deref(),
+                // As above: the caller is the subject of the event, so it
+                // answers to the generic field names too.
+                "Image" => f.source_image.as_deref(),
+                "ProcessId" => f.source_process_id.as_deref(),
+                "TargetProcessId" => f.target_process_id.as_deref(),
+                "TargetImage" => f.target_image.as_deref(),
+                "GrantedAccess" => f.granted_access.as_deref(),
+                "TargetThreadId" => f.target_thread_id.as_deref(),
                 "User" => f.user.as_deref(),
                 _ => None,
             },
@@ -360,6 +379,10 @@ pub enum EventCategory {
     Registry,
     Dns,
     ImageLoad,
+    /// A thread created in another process: the shape of code injection.
+    RemoteThread,
+    /// A handle opened to another process or thread.
+    ProcessAccess,
     Scripting,
     PowerShellModule,
     Wmi,
@@ -397,6 +420,7 @@ mod round_trip_tests {
             event_id_string: "11".to_string(),
             opcode: 64,
             fields: EventFields::FileEvent(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some(r"C:\Temp\rustinel.txt".to_string()),
                 process_id: Some("6120".to_string()),
@@ -488,6 +512,10 @@ mod round_trip_tests {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some("/bin/zsh".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -745,6 +773,10 @@ mod round_trip_tests {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -788,6 +820,10 @@ mod round_trip_tests {
         event.event_id_string = "1".to_string();
         event.opcode = 1;
         event.fields = EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(image.to_string()),
             image_source: None,
             image_truncated: None,

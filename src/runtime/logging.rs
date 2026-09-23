@@ -557,6 +557,7 @@ mod filter_tests {
                     rule_description: None,
                     rule_id: None,
                     engine,
+                    tags: Vec::new(),
                     event: event.clone(),
                     match_details: None,
                 };

@@ -279,7 +279,11 @@ async fn run_edr(
 
     // 2.1 Initialize Active Response Engine (optional)
     let response_config = Arc::new(ArcSwap::from(Arc::new(cfg.response.clone())));
-    let (response_engine, response_worker_handle) = ResponseEngine::new(response_config.clone());
+    let (response_engine, response_worker_handle) = ResponseEngine::with_options(
+        response_config.clone(),
+        crate::response::executor::default_executor(&response_config.load()),
+        Some(alert_sink.clone()),
+    );
     info!(
         target: "rustinel",
         logs_dir = ?cfg.logging.directory,
@@ -352,12 +356,19 @@ async fn run_edr(
     // Start shared sensor event pipeline
     let (sensor_tx, mut sensor_rx) = mpsc::channel::<SensorEvent>(SENSOR_EVENT_CHANNEL_CAPACITY);
     let router_clone = Arc::clone(&pipeline.router);
+    let process_config = cfg.process.clone();
     let sensor_worker_handle = tokio::task::spawn_blocking(move || {
         info!(target: "sensor", "Sensor event worker thread started");
+        // One enricher per worker thread. It owns the hash cache, which is
+        // what makes hashing every process start affordable: a machine runs
+        // the same few binaries over and over, and each is read once per TTL.
+        let mut enricher = crate::sensor::enrichment::Enricher::new(&process_config);
+
         while let Some(mut event) = sensor_rx.blocking_recv() {
-            // PE parsing opens and maps the image, so it must happen after the
-            // bounded channel rather than in the ETW callback.
-            crate::sensor::windows::enrich_event(&mut event);
+            // PE parsing and hashing open and read the image, so both must
+            // happen after the bounded channel rather than in the ETW
+            // callback, and before the router so a rule can see the result.
+            enricher.enrich(&mut event);
             router_clone.route_event(&event);
         }
         info!(target: "sensor", "Sensor event worker thread shutting down");

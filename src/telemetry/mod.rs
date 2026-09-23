@@ -912,7 +912,9 @@ impl SensorEventCategoryCounters {
     }
 }
 
-static SENSOR_EVENT_CATEGORIES: [SensorEventCategoryCounters; 12] = [
+static SENSOR_EVENT_CATEGORIES: [SensorEventCategoryCounters; 14] = [
+    SensorEventCategoryCounters::new(),
+    SensorEventCategoryCounters::new(),
     SensorEventCategoryCounters::new(),
     SensorEventCategoryCounters::new(),
     SensorEventCategoryCounters::new(),
@@ -941,6 +943,8 @@ fn sensor_event_category(category: EventCategory) -> (usize, &'static str) {
         EventCategory::Service => (9, "service"),
         EventCategory::Task => (10, "task"),
         EventCategory::Security => (11, "security"),
+        EventCategory::RemoteThread => (12, "remote_thread"),
+        EventCategory::ProcessAccess => (13, "process_access"),
     }
 }
 

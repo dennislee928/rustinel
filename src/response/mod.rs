@@ -2,72 +2,184 @@
 //!
 //! Non-blocking alert intake with a background worker that can terminate
 //! processes on critical alerts.
+//!
+//! The engine decides *whether* to act; an
+//! [`ActionExecutor`](executor::ActionExecutor) decides *how*. Everything
+//! Rustinel can do today runs in user mode and therefore acts after the
+//! operation it is responding to has already completed. See [`executor`] for
+//! what a kernel driver would change.
 
+pub mod action;
+pub mod audit;
+pub mod cli;
+pub mod executor;
+pub mod policy;
+pub mod safety;
+
+#[cfg(test)]
+pub(crate) mod tests_support;
+
+use crate::alerts::AlertSink;
 use crate::config::ResponseConfig;
 use crate::models::{Alert, AlertSeverity, DetectionEngine, EventFields};
+use crate::response::action::{ActionKind, ActionTargets};
+use crate::response::audit::{ActionOutcome, ResponseAuditRecord};
+use crate::response::executor::ActionExecutor;
+use crate::response::policy::PreparedPolicy;
+use crate::response::safety::{SafetyGate, SuppressionReason};
 use crate::utils::{
     hash_command_line, normalize_path_for_comparison, validate_process_identity, ProcessIdentity,
 };
 use arc_swap::ArcSwap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 const TARGET_RESPONSE: &str = "response";
 static IDENTITY_MISMATCH_SKIPS: AtomicU64 = AtomicU64::new(0);
 
+/// One alert's worth of work, queued for the worker.
+///
+/// The resolved actions travel with the task, but the worker revalidates them
+/// against the configuration in force when it runs: a hot reload between
+/// queueing and execution must be able to call an action off.
 #[derive(Debug)]
 struct ResponseTask {
     severity: AlertSeverity,
     rule_name: String,
+    rule_id: Option<String>,
     engine: DetectionEngine,
+    /// Policy rule that selected the actions, for logs and audit.
+    policy_rule: String,
+    /// Actions to attempt, already ordered.
+    actions: Vec<ActionKind>,
+    /// Whether the policy rule itself asked for a dry run.
+    rule_dry_run: bool,
     pid: Option<u32>,
     image: Option<String>,
-    identity: Option<ProcessIdentity>,
+    /// Everything the alert named for an action to act on.
+    targets: ActionTargets,
 }
 
 #[derive(Clone)]
 pub struct ResponseEngine {
     config: Arc<ArcSwap<ResponseConfig>>,
+    /// Compiled view of `config`, recompiled only when that pointer changes.
+    policy: Arc<ArcSwap<PreparedPolicy>>,
     self_pid: u32,
     tx: mpsc::Sender<ResponseTask>,
+    executor: Arc<dyn ActionExecutor>,
 }
 
+/// What the engine concluded about one alert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseDecision {
+    /// Response is switched off.
     Disabled,
+    /// Below `response.min_severity`, in the absence of policy rules.
     BelowSeverity {
         severity: AlertSeverity,
         min_severity: AlertSeverity,
     },
+    /// Policy rules are configured and none of them covers this alert.
+    NoPolicyMatch { severity: AlertSeverity },
+    /// The alert names no process to act on.
     MissingPid,
-    ProtectedPid {
-        pid: u32,
-    },
-    MissingImage {
-        pid: u32,
-    },
-    Allowlisted {
+    /// The target is the agent itself or a system PID.
+    ProtectedPid { pid: u32 },
+    /// The target's image is unknown, so it cannot be checked against the
+    /// allowlist; acting blind is worse than not acting.
+    MissingImage { pid: u32 },
+    /// The target is allowlisted.
+    Allowlisted { pid: u32, image: String },
+    /// A rule matched but every action it named is switched off or
+    /// unsupported.
+    NoEnabledAction {
         pid: u32,
         image: String,
+        policy_rule: String,
     },
+    /// Actions selected, and reported rather than performed.
     DryRun {
         pid: u32,
         image: String,
+        actions: Vec<ActionKind>,
+        policy_rule: String,
     },
-    Terminate {
+    /// Actions selected, and to be performed.
+    Execute {
         pid: u32,
         image: String,
+        actions: Vec<ActionKind>,
+        policy_rule: String,
     },
+}
+
+impl ResponseDecision {
+    /// Whether this decision reaches the worker at all.
+    fn is_actionable(&self) -> bool {
+        !matches!(
+            self,
+            ResponseDecision::Disabled
+                | ResponseDecision::BelowSeverity { .. }
+                | ResponseDecision::NoPolicyMatch { .. }
+        )
+    }
+
+    /// Actions this decision selected, if any.
+    fn actions(&self) -> &[ActionKind] {
+        match self {
+            ResponseDecision::DryRun { actions, .. }
+            | ResponseDecision::Execute { actions, .. } => actions,
+            _ => &[],
+        }
+    }
+
+    /// Policy rule that produced it, if one matched.
+    fn policy_rule(&self) -> &str {
+        match self {
+            ResponseDecision::NoEnabledAction { policy_rule, .. }
+            | ResponseDecision::DryRun { policy_rule, .. }
+            | ResponseDecision::Execute { policy_rule, .. } => policy_rule,
+            _ => "",
+        }
+    }
 }
 
 impl ResponseEngine {
     pub fn new(cfg: Arc<ArcSwap<ResponseConfig>>) -> (Self, tokio::task::JoinHandle<()>) {
+        let executor = executor::default_executor(&cfg.load());
+        Self::with_options(cfg, executor, None)
+    }
+
+    /// Build an engine that acts through a specific executor.
+    ///
+    /// Tests substitute [`executor::MockExecutor`] to assert on what would
+    /// have been done without touching a real process.
+    pub fn with_executor(
+        cfg: Arc<ArcSwap<ResponseConfig>>,
+        executor: Arc<dyn ActionExecutor>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::with_options(cfg, executor, None)
+    }
+
+    /// Build an engine with an audit destination.
+    ///
+    /// The live pipeline passes its alert sink here so every attempted action
+    /// lands in the same stream as the detections that asked for it.
+    pub fn with_options(
+        cfg: Arc<ArcSwap<ResponseConfig>>,
+        executor: Arc<dyn ActionExecutor>,
+        audit: Option<AlertSink>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let channel_capacity = cfg.load().channel_capacity;
         let (tx, mut rx) = mpsc::channel(channel_capacity);
         let self_pid = std::process::id();
         let worker_cfg = cfg.clone();
+        let worker_executor = executor.clone();
 
         let handle = tokio::spawn(async move {
             let initial = worker_cfg.load();
@@ -76,59 +188,76 @@ impl ResponseEngine {
                 enabled = initial.enabled,
                 prevention_enabled = initial.prevention_enabled,
                 min_severity = %initial.min_severity,
+                executor = worker_executor.name(),
                 "Active response worker started"
             );
 
-            let mut prepared = PreparedConfig::from_raw(&worker_cfg.load());
+            let mut policy = PreparedPolicy::from_raw(&worker_cfg.load());
+            let mut safety = SafetyGate::new();
 
             while let Some(task) = rx.recv().await {
                 let current_raw = worker_cfg.load();
-                prepared.refresh_if_changed(&current_raw);
+                policy.refresh_if_changed(&current_raw);
 
-                if !prepared.enabled {
+                if !policy.enabled {
                     continue;
                 }
 
                 handle_task(
                     task,
-                    prepared.prevention_enabled,
+                    &policy,
+                    &mut safety,
                     self_pid,
-                    &prepared.allowlist_images,
-                    &prepared.allowlist_paths,
+                    worker_executor.as_ref(),
+                    audit.as_ref(),
                 );
             }
 
             debug!(target: TARGET_RESPONSE, "Active response worker shutting down");
         });
 
+        let policy = Arc::new(ArcSwap::from(Arc::new(PreparedPolicy::from_raw(
+            &cfg.load_full(),
+        ))));
+
         (
             Self {
                 config: cfg,
+                policy,
                 self_pid,
                 tx,
+                executor,
             },
             handle,
         )
     }
 
+    /// Executor this engine acts through.
+    pub fn executor(&self) -> &Arc<dyn ActionExecutor> {
+        &self.executor
+    }
+
     pub fn handle_alert(&self, alert: &Alert) {
         let decision = self.decision_for_alert(alert);
-        if matches!(
-            decision,
-            ResponseDecision::Disabled | ResponseDecision::BelowSeverity { .. }
-        ) {
+        if !decision.is_actionable() {
             return;
         }
 
         let (pid, image) = extract_process_info(alert);
+        let policy = self.current_policy();
+        let rule_dry_run = policy.match_alert(alert).is_some_and(|rule| rule.dry_run);
 
         let task = ResponseTask {
             severity: effective_alert_severity(alert),
             rule_name: alert.rule_name.clone(),
+            rule_id: alert.rule_id.clone(),
             engine: alert.engine,
+            policy_rule: decision.policy_rule().to_string(),
+            actions: decision.actions().to_vec(),
+            rule_dry_run,
             pid,
             image,
-            identity: extract_process_identity(alert),
+            targets: extract_action_targets(alert),
         };
 
         if let Err(err) =
@@ -143,61 +272,28 @@ impl ResponseEngine {
     }
 
     pub fn decision_for_alert(&self, alert: &Alert) -> ResponseDecision {
-        let current_cfg = self.config.load();
-        if !current_cfg.enabled {
-            return ResponseDecision::Disabled;
-        }
-
-        let severity = effective_alert_severity(alert);
-        let min_severity = parse_min_severity(&current_cfg.min_severity);
-        if !severity_at_least(severity, min_severity) {
-            return ResponseDecision::BelowSeverity {
-                severity,
-                min_severity,
-            };
-        }
-
-        let (pid, image) = extract_process_info(alert);
-        let allowlist_images = normalize_allowlist_images(&current_cfg.allowlist_images);
-        let allowlist_paths = normalize_allowlist_paths(&current_cfg.allowlist_paths);
         decide_response(
-            pid,
-            image.as_deref(),
-            current_cfg.prevention_enabled,
+            &self.current_policy(),
+            alert,
             self.self_pid,
-            &allowlist_images,
-            &allowlist_paths,
+            self.executor.as_ref(),
         )
     }
-}
 
-/// Pre-computed / cached view of a `ResponseConfig`, rebuilt only when
-/// the underlying `Arc` pointer changes (i.e. on hot-reload).
-struct PreparedConfig {
-    /// Pointer to the raw config this snapshot was built from.
-    source: Arc<ResponseConfig>,
-    enabled: bool,
-    prevention_enabled: bool,
-    allowlist_images: Vec<String>,
-    allowlist_paths: Vec<String>,
-}
-
-impl PreparedConfig {
-    fn from_raw(raw: &Arc<ResponseConfig>) -> Self {
-        Self {
-            source: Arc::clone(raw),
-            enabled: raw.enabled,
-            prevention_enabled: raw.prevention_enabled,
-            allowlist_images: normalize_allowlist_images(&raw.allowlist_images),
-            allowlist_paths: normalize_allowlist_paths(&raw.allowlist_paths),
+    /// The compiled policy for the configuration in force right now.
+    ///
+    /// Recompiles only when the configuration pointer has changed, so the
+    /// steady state is a pointer comparison rather than a parse.
+    fn current_policy(&self) -> Arc<PreparedPolicy> {
+        let current_cfg = self.config.load_full();
+        let cached = self.policy.load_full();
+        if cached.matches_source(&current_cfg) {
+            return cached;
         }
-    }
 
-    /// Rebuild the cached snapshot only if the underlying `Arc` pointer has changed.
-    fn refresh_if_changed(&mut self, current: &Arc<ResponseConfig>) {
-        if !Arc::ptr_eq(&self.source, current) {
-            *self = Self::from_raw(current);
-        }
+        let fresh = Arc::new(PreparedPolicy::from_raw(&current_cfg));
+        self.policy.store(Arc::clone(&fresh));
+        fresh
     }
 }
 
@@ -208,199 +304,376 @@ fn effective_alert_severity(alert: &Alert) -> AlertSeverity {
     }
 }
 
+/// Decide what, if anything, to do about an alert.
+///
+/// Pure and side-effect free: the rate limiter and the cooldown are consulted
+/// by the worker at execution time, not here, so asking what would happen
+/// never changes what will.
 fn decide_response(
-    pid: Option<u32>,
-    image: Option<&str>,
-    prevention_enabled: bool,
+    policy: &PreparedPolicy,
+    alert: &Alert,
     self_pid: u32,
-    allowlist_images: &[String],
-    allowlist_paths: &[String],
+    executor: &dyn ActionExecutor,
 ) -> ResponseDecision {
-    let pid = match pid {
-        Some(pid) => pid,
-        None => return ResponseDecision::MissingPid,
-    };
-
-    if pid <= 4 || pid == self_pid {
-        return ResponseDecision::ProtectedPid { pid };
+    if !policy.enabled {
+        return ResponseDecision::Disabled;
     }
 
-    let image = match image {
-        Some(image) => image,
-        None => return ResponseDecision::MissingImage { pid },
+    let severity = effective_alert_severity(alert);
+
+    let Some(rule) = policy.match_alert(alert) else {
+        // In legacy mode the only rule is the severity floor, so saying so is
+        // more useful than saying no rule matched.
+        return if policy.legacy_mode {
+            ResponseDecision::BelowSeverity {
+                severity,
+                min_severity: policy.min_severity,
+            }
+        } else {
+            ResponseDecision::NoPolicyMatch { severity }
+        };
     };
 
-    if is_allowlisted(image, allowlist_images, allowlist_paths) {
-        return ResponseDecision::Allowlisted {
-            pid,
-            image: image.to_string(),
+    let (pid, image) = extract_process_info(alert);
+    let target = match check_target(pid, image.as_deref(), self_pid, policy) {
+        Ok(target) => target,
+        Err(decision) => return decision,
+    };
+
+    // An action must be selected by the rule, switched on in configuration,
+    // something the executor can do, and aimed at something this alert
+    // actually named.
+    let targets = extract_action_targets(alert);
+    let actions: Vec<ActionKind> = rule
+        .actions
+        .iter()
+        .copied()
+        .filter(|kind| {
+            policy.action_enabled(*kind)
+                && executor.capabilities().supports(*kind)
+                && targets.has_target_for(*kind)
+        })
+        .collect();
+
+    if actions.is_empty() {
+        return ResponseDecision::NoEnabledAction {
+            pid: target.pid,
+            image: target.image,
+            policy_rule: rule.name.clone(),
         };
     }
 
-    if prevention_enabled {
-        ResponseDecision::Terminate {
-            pid,
-            image: image.to_string(),
-        }
-    } else {
-        ResponseDecision::DryRun {
-            pid,
-            image: image.to_string(),
-        }
+    // A rule may ask for a dry run, but it can never turn prevention on.
+    if !policy.prevention_enabled || rule.dry_run {
+        return ResponseDecision::DryRun {
+            pid: target.pid,
+            image: target.image,
+            actions,
+            policy_rule: rule.name.clone(),
+        };
+    }
+
+    ResponseDecision::Execute {
+        pid: target.pid,
+        image: target.image,
+        actions,
+        policy_rule: rule.name.clone(),
     }
 }
 
+/// A process the engine is allowed to act on.
+struct Target {
+    pid: u32,
+    image: String,
+}
+
+/// Check the target itself, independent of which action is being considered.
+fn check_target(
+    pid: Option<u32>,
+    image: Option<&str>,
+    self_pid: u32,
+    policy: &PreparedPolicy,
+) -> Result<Target, ResponseDecision> {
+    let Some(pid) = pid else {
+        return Err(ResponseDecision::MissingPid);
+    };
+
+    if pid <= 4 || pid == self_pid {
+        return Err(ResponseDecision::ProtectedPid { pid });
+    }
+
+    let Some(image) = image else {
+        return Err(ResponseDecision::MissingImage { pid });
+    };
+
+    if is_allowlisted(image, &policy.allowlist_images, &policy.allowlist_paths) {
+        return Err(ResponseDecision::Allowlisted {
+            pid,
+            image: image.to_string(),
+        });
+    }
+
+    Ok(Target {
+        pid,
+        image: image.to_string(),
+    })
+}
+
+/// Perform one task: revalidate, then run each action in turn.
 fn handle_task(
     task: ResponseTask,
-    prevention_enabled: bool,
+    policy: &PreparedPolicy,
+    safety: &mut SafetyGate,
     self_pid: u32,
-    allowlist_images: &[String],
-    allowlist_paths: &[String],
+    executor: &dyn ActionExecutor,
+    audit: Option<&AlertSink>,
 ) {
-    match decide_response(
-        task.pid,
-        task.image.as_deref(),
-        prevention_enabled,
-        self_pid,
-        allowlist_images,
-        allowlist_paths,
-    ) {
-        ResponseDecision::MissingPid => {
-            warn!(
-                target: TARGET_RESPONSE,
-                rule = %task.rule_name,
-                engine = ?task.engine,
-                severity = ?task.severity,
-                "Active response skipped: missing pid"
-            );
+    // The configuration may have changed since this task was queued, so the
+    // target is checked again against what is in force now.
+    let target = match check_target(task.pid, task.image.as_deref(), self_pid, policy) {
+        Ok(target) => target,
+        Err(decision) => {
+            log_skipped_target(&task, &decision);
+            return;
         }
-        ResponseDecision::ProtectedPid { pid } => {
-            info!(
-                target: TARGET_RESPONSE,
-                pid,
-                rule = %task.rule_name,
-                engine = ?task.engine,
-                severity = ?task.severity,
-                "Active response skipped: protected pid"
-            );
-        }
-        ResponseDecision::MissingImage { pid } => {
-            warn!(
-                target: TARGET_RESPONSE,
-                pid,
-                rule = %task.rule_name,
-                engine = ?task.engine,
-                severity = ?task.severity,
-                "Active response skipped: missing image"
-            );
-        }
-        ResponseDecision::Allowlisted { pid, image } => {
-            info!(
-                target: TARGET_RESPONSE,
-                pid,
-                image = %image,
-                rule = %task.rule_name,
-                engine = ?task.engine,
-                severity = ?task.severity,
-                "Active response skipped: allowlisted"
-            );
-        }
-        ResponseDecision::DryRun { pid, image } => {
-            info!(
-                target: TARGET_RESPONSE,
-                pid,
-                image = %image,
-                rule = %task.rule_name,
-                engine = ?task.engine,
-                severity = ?task.severity,
-                dry_run = true,
-                "Active response would terminate process"
-            );
-        }
-        ResponseDecision::Terminate { pid, image } => {
-            let expected_identity = task.identity.unwrap_or_else(|| ProcessIdentity {
-                pid,
-                image: image.clone(),
-                start_time: None,
-                command_line_hash: None,
-            });
+    };
 
-            match validate_process_identity(&expected_identity) {
-                Ok(current_identity) => match terminate_process(pid) {
-                    Ok(()) => {
-                        info!(
-                            target: TARGET_RESPONSE,
-                            pid,
-                            image = %image,
-                            current_image = %current_identity.image,
-                            rule = %task.rule_name,
-                            engine = ?task.engine,
-                            severity = ?task.severity,
-                            "Active response terminated process"
-                        );
-                    }
-                    Err(err) => {
-                        error!(
-                            target: TARGET_RESPONSE,
-                            pid,
-                            image = %image,
-                            rule = %task.rule_name,
-                            engine = ?task.engine,
-                            severity = ?task.severity,
-                            error = %err,
-                            "Active response failed to terminate process"
-                        );
-                    }
+    if task.actions.is_empty() {
+        info!(
+            target: TARGET_RESPONSE,
+            pid = target.pid,
+            image = %target.image,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            "Active response skipped: no enabled action"
+        );
+        return;
+    }
+
+    // One identity check covers every action in the set: if the PID was
+    // recycled, nothing in the set is safe to run against it.
+    let expected_identity = task
+        .targets
+        .process
+        .clone()
+        .unwrap_or_else(|| ProcessIdentity {
+            pid: target.pid,
+            image: target.image.clone(),
+            start_time: None,
+            command_line_hash: None,
+        });
+
+    let current_identity = match validate_process_identity(&expected_identity) {
+        Ok(identity) => identity,
+        Err(err) => {
+            let skipped_identity_mismatch_count =
+                IDENTITY_MISMATCH_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                target: TARGET_RESPONSE,
+                pid = target.pid,
+                image = %target.image,
+                rule = %task.rule_name,
+                engine = ?task.engine,
+                severity = ?task.severity,
+                skipped_identity_mismatch_count,
+                reason = %err,
+                "Active response skipped: process identity mismatch"
+            );
+            return;
+        }
+    };
+
+    // A rule dry run tightens; it cannot loosen a global dry run.
+    let dry_run = !policy.prevention_enabled || task.rule_dry_run;
+
+    // Act on the revalidated identity, not the one the alert carried.
+    let targets = ActionTargets {
+        process: Some(current_identity.clone()),
+        ..task.targets.clone()
+    };
+
+    for kind in ordered_actions(&task.actions) {
+        let Some(action) = targets.build(kind) else {
+            // The subject went missing between decision and execution.
+            log_outcome(
+                &task,
+                &target,
+                kind,
+                &ActionOutcome::Suppressed {
+                    reason: SuppressionReason::MissingTarget,
                 },
-                Err(err) => {
-                    let skipped_identity_mismatch_count =
-                        IDENTITY_MISMATCH_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
-                    warn!(
-                        target: TARGET_RESPONSE,
-                        pid,
-                        image = %image,
-                        rule = %task.rule_name,
-                        engine = ?task.engine,
-                        severity = ?task.severity,
-                        skipped_identity_mismatch_count,
-                        reason = %err,
-                        "Active response skipped: process identity mismatch"
-                    );
-                }
-            }
-        }
-        ResponseDecision::Disabled | ResponseDecision::BelowSeverity { .. } => {}
-    }
-}
-
-fn parse_min_severity(value: &str) -> AlertSeverity {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "critical" => AlertSeverity::Critical,
-        "high" => AlertSeverity::High,
-        "medium" => AlertSeverity::Medium,
-        "low" => AlertSeverity::Low,
-        other => {
-            warn!(
-                target: TARGET_RESPONSE,
-                min_severity = %other,
-                "Unknown response.min_severity; defaulting to critical"
             );
-            AlertSeverity::Critical
+            continue;
+        };
+
+        let now = Instant::now();
+        let outcome = match safety.check(&action, policy, executor, now) {
+            Err(reason) => ActionOutcome::Suppressed { reason },
+            Ok(()) if dry_run => ActionOutcome::DryRun,
+            Ok(()) => match executor.execute(&action) {
+                Ok(receipt) => {
+                    safety.commit(&action, now);
+                    ActionOutcome::Performed {
+                        executor: receipt.executor,
+                        enforcement: receipt.enforcement,
+                        detail: receipt.detail,
+                    }
+                }
+                Err(err) => ActionOutcome::Failed {
+                    executor: executor.name(),
+                    error: err.to_string(),
+                },
+            },
+        };
+
+        log_outcome(&task, &target, kind, &outcome);
+
+        if let Some(sink) = audit.filter(|_| policy.audit_to_alerts) {
+            sink.write_response(&ResponseAuditRecord {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                action: kind,
+                outcome,
+                target: action.target_key(),
+                policy_rule: task.policy_rule.clone(),
+                rule_name: task.rule_name.clone(),
+                rule_id: task.rule_id.clone(),
+                severity: task.severity,
+                engine: task.engine,
+                pid: Some(target.pid),
+                image: Some(target.image.clone()),
+                prevention_enabled: policy.prevention_enabled,
+            });
+        }
+
+        // Once the process is gone, later actions against it are meaningless.
+        if kind == ActionKind::TerminateProcess && !dry_run {
+            break;
         }
     }
 }
 
-fn severity_rank(severity: AlertSeverity) -> u8 {
-    match severity {
-        AlertSeverity::Low => 0,
-        AlertSeverity::Medium => 1,
-        AlertSeverity::High => 2,
-        AlertSeverity::Critical => 3,
+/// Order actions so that each one still makes sense after the previous.
+///
+/// Freezing precedes killing, so a rule asking for both preserves the process
+/// long enough for the containment steps between them to run.
+fn ordered_actions(actions: &[ActionKind]) -> Vec<ActionKind> {
+    let mut ordered = actions.to_vec();
+    ordered.sort_by_key(|kind| match kind {
+        ActionKind::SuspendProcess => 0,
+        ActionKind::IsolateHost => 1,
+        ActionKind::BlockProcessNetwork => 2,
+        ActionKind::QuarantineFile => 3,
+        ActionKind::RevertRegistry => 4,
+        ActionKind::DisableService => 5,
+        ActionKind::DisableScheduledTask => 6,
+        ActionKind::TerminateProcess => 7,
+    });
+    ordered
+}
+
+/// Log a task that never reached an action.
+fn log_skipped_target(task: &ResponseTask, decision: &ResponseDecision) {
+    match decision {
+        ResponseDecision::MissingPid => warn!(
+            target: TARGET_RESPONSE,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            "Active response skipped: missing pid"
+        ),
+        ResponseDecision::ProtectedPid { pid } => info!(
+            target: TARGET_RESPONSE,
+            pid = *pid,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            "Active response skipped: protected pid"
+        ),
+        ResponseDecision::MissingImage { pid } => warn!(
+            target: TARGET_RESPONSE,
+            pid = *pid,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            "Active response skipped: missing image"
+        ),
+        ResponseDecision::Allowlisted { pid, image } => info!(
+            target: TARGET_RESPONSE,
+            pid = *pid,
+            image = %image,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            "Active response skipped: allowlisted"
+        ),
+        other => debug!(
+            target: TARGET_RESPONSE,
+            rule = %task.rule_name,
+            decision = ?other,
+            "Active response took no action"
+        ),
     }
 }
 
-fn severity_at_least(severity: AlertSeverity, min: AlertSeverity) -> bool {
-    severity_rank(severity) >= severity_rank(min)
+/// Log what became of one action.
+fn log_outcome(task: &ResponseTask, target: &Target, kind: ActionKind, outcome: &ActionOutcome) {
+    match outcome {
+        ActionOutcome::Performed {
+            executor,
+            enforcement,
+            ..
+        } => info!(
+            target: TARGET_RESPONSE,
+            pid = target.pid,
+            image = %target.image,
+            action = %kind,
+            policy_rule = %task.policy_rule,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            executor = *executor,
+            enforcement = %enforcement,
+            "Active response performed action"
+        ),
+        ActionOutcome::DryRun => info!(
+            target: TARGET_RESPONSE,
+            pid = target.pid,
+            image = %target.image,
+            action = %kind,
+            policy_rule = %task.policy_rule,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            dry_run = true,
+            "Active response would perform action"
+        ),
+        ActionOutcome::Suppressed { reason } => info!(
+            target: TARGET_RESPONSE,
+            pid = target.pid,
+            image = %target.image,
+            action = %kind,
+            policy_rule = %task.policy_rule,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            reason = %reason,
+            "Active response suppressed action"
+        ),
+        ActionOutcome::Failed { executor, error } => error!(
+            target: TARGET_RESPONSE,
+            pid = target.pid,
+            image = %target.image,
+            action = %kind,
+            policy_rule = %task.policy_rule,
+            rule = %task.rule_name,
+            engine = ?task.engine,
+            severity = ?task.severity,
+            executor = *executor,
+            error = %error,
+            "Active response failed to perform action"
+        ),
+    }
 }
 
 fn extract_process_info(alert: &Alert) -> (Option<u32>, Option<String>) {
@@ -452,14 +725,16 @@ fn extract_process_info(alert: &Alert) -> (Option<u32>, Option<String>) {
             pid = parse_pid(f.process_id.as_deref());
             image = f.image.clone();
         }
+        // For both injection and handle access the process to act on is the
+        // *source*: the target is the victim, and acting on it would finish
+        // the job the injector started.
         EventFields::RemoteThread(f) => {
-            if let Some(target_pid) = parse_pid(f.target_process_id.as_deref()) {
-                pid = Some(target_pid);
-                image = f.target_image.clone();
-            } else {
-                pid = parse_pid(f.source_process_id.as_deref());
-                image = f.source_image.clone();
-            }
+            pid = parse_pid(f.source_process_id.as_deref());
+            image = f.source_image.clone();
+        }
+        EventFields::ProcessAccess(f) => {
+            pid = parse_pid(f.source_process_id.as_deref());
+            image = f.source_image.clone();
         }
         EventFields::SecurityAudit(f) => {
             pid = f.process_id();
@@ -485,6 +760,69 @@ fn extract_process_info(alert: &Alert) -> (Option<u32>, Option<String>) {
     }
 
     (pid, image)
+}
+
+/// Gather everything the alert names for an action to act on.
+///
+/// The process comes from the same place response has always taken it. The
+/// rest are read from the event that fired, so an action only ever acts on
+/// something the detection actually saw.
+fn extract_action_targets(alert: &Alert) -> ActionTargets {
+    let mut targets = ActionTargets {
+        process: extract_process_identity(alert),
+        ..ActionTargets::default()
+    };
+
+    match &alert.event.fields {
+        EventFields::FileEvent(f) => {
+            targets.file = f
+                .target_filename
+                .as_deref()
+                .or(f.source_filename.as_deref())
+                .map(PathBuf::from);
+        }
+        EventFields::RegistryEvent(f) => {
+            if let Some(object) = f.target_object.as_deref() {
+                let (key, value) = split_registry_target(object);
+                targets.registry_key = Some(key);
+                targets.registry_value = value;
+            }
+        }
+        EventFields::ServiceCreation(f) => {
+            targets.service = f.service_name.clone();
+            targets.file = f.service_file_name.as_deref().map(PathBuf::from);
+        }
+        EventFields::TaskCreation(f) => {
+            targets.task = f.task_name.clone();
+        }
+        _ => {}
+    }
+
+    // A YARA hit on a file names the file in the rule description rather than
+    // in an event field, so the image is the only thing to quarantine.
+    if targets.file.is_none() && alert.engine == DetectionEngine::Yara {
+        if let Some(process) = &targets.process {
+            targets.file = Some(PathBuf::from(&process.image));
+        }
+    }
+
+    targets
+}
+
+/// Split a registry path into the key and, where present, the value name.
+///
+/// Sysmon writes a value write as `HKLM\\...\\Run\\Updater`, with the value
+/// name as the last segment and no way to tell it apart from a subkey. A
+/// `registry_set` event is a value write by definition, so the last segment is
+/// the value there and the whole path is the key otherwise.
+fn split_registry_target(object: &str) -> (String, Option<String>) {
+    let trimmed = object.trim_end_matches('\\');
+    match trimmed.rsplit_once('\\') {
+        Some((key, value)) if !key.is_empty() && !value.is_empty() => {
+            (key.to_string(), Some(value.to_string()))
+        }
+        _ => (trimmed.to_string(), None),
+    }
 }
 
 fn extract_process_identity(alert: &Alert) -> Option<ProcessIdentity> {
@@ -581,41 +919,6 @@ fn is_allowlisted(image: &str, allowlist_images: &[String], allowlist_paths: &[S
     false
 }
 
-#[cfg(windows)]
-fn terminate_process(pid: u32) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) }
-        .map_err(|err| format!("OpenProcess failed: {}", err))?;
-
-    let result = unsafe { TerminateProcess(handle, 1) };
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(err) => Err(format!("TerminateProcess failed: {}", err)),
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn terminate_process(pid: u32) -> Result<(), String> {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    if ret == 0 {
-        Ok(())
-    } else {
-        let err = std::io::Error::last_os_error();
-        Err(format!("kill({}, SIGKILL) failed: {}", pid, err))
-    }
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn terminate_process(_pid: u32) -> Result<(), String> {
-    Err("Active response termination is not supported on this platform".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,6 +968,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-02-03T00:00:00Z".to_string(),
                 source_seq: None,
@@ -676,6 +980,10 @@ mod tests {
                 event_id_string: "1".to_string(),
                 opcode: 1,
                 fields: EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: image.map(str::to_string),
                     image_source: None,
                     image_truncated: None,
@@ -770,6 +1078,7 @@ mod tests {
                         channel_capacity: 4,
                         allowlist_images: vec![],
                         allowlist_paths: vec!["/usr/bin/".to_string()],
+                        ..ResponseConfig::default()
                     },
                 )));
                 let (engine, worker) = ResponseEngine::new(cfg);

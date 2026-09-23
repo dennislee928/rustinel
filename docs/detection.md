@@ -101,11 +101,53 @@ added separately when their windows fire.
 | `dns_query` | Yes | Yes | Yes | Generic `category: dns` and `service: dns`, `category: network` also supported |
 | `registry_event` / `registry_*` | Yes | No | No | Windows only |
 | `image_load` | Yes | No | No | Windows only |
+| `create_remote_thread` | Yes | No | No | Windows only, see below |
+| `process_access` | Yes | No | No | Windows only, filtered by requested access, see below |
 | `ps_script` | Yes | No | No | Windows only |
 | `ps_module` | Yes | No | No | Windows only, requires Module Logging policy, see below |
 | `wmi_event` | Yes | No | No | Windows only, see below |
 | `service_creation` | Yes | No | No | Windows only |
 | `task_creation` | Yes | No | No | Windows only |
+
+#### Cross-process telemetry
+
+`create_remote_thread` and `process_access` are the two families that make
+injection and credential dumping visible, and both are collected differently
+from the way Sysmon collects them, with consequences worth knowing.
+
+`create_remote_thread` comes from `Microsoft-Windows-Kernel-Process` thread-start
+events, enabled as a second subscription to that provider on the main session so
+that thread creation, one of the highest-rate events on Windows, cannot delay
+the low-latency process stream. Only starts where the creating process differs
+from the thread's own process are reported. `StartAddress` is present;
+`StartModule` and `StartFunction` are not, because the provider does not resolve
+the address and doing so per event would mean reading the target's memory.
+
+`process_access` comes from `Microsoft-Windows-Kernel-Audit-API-Calls`, which is
+undocumented but is the only handle-access source reachable without a kernel
+driver: `Microsoft-Windows-Threat-Intelligence` requires the agent to run as a
+Protected Process Light under a Microsoft-signed ELAM driver, and Sysmon's event
+10 requires Sysmon's driver. Three filters run inside the sensor, because the raw
+rate is far too high to carry:
+
+- a process opening a handle to itself is dropped
+- a failed open is dropped
+- an open that requested none of the dangerous access rights is dropped
+
+The dangerous rights are `PROCESS_CREATE_THREAD`, `PROCESS_VM_OPERATION`,
+`PROCESS_VM_READ`, `PROCESS_VM_WRITE`, and `PROCESS_DUP_HANDLE` for a process,
+and `THREAD_SUSPEND_RESUME`, `THREAD_GET_CONTEXT`, `THREAD_SET_CONTEXT`, and
+`THREAD_SET_THREAD_TOKEN` for a thread. A rule that expects to see routine
+`PROCESS_QUERY_LIMITED_INFORMATION` opens will never match, by design.
+
+`GrantedAccess` carries the access that was *requested*. Windows grants at most
+what was asked for, so the value is an upper bound rather than a record of what
+the caller received. It keeps Sysmon's field name because that is the name rules
+read.
+
+Both families name their peers by bare process ID, and the images are resolved
+from the process cache. A process that started before Rustinel did, or whose
+record has been evicted, resolves to no image rather than to a guess.
 
 The Windows Security channel is a family of its own. Rules for it carry no
 `category` — `product: windows`, `service: security`, and an `EventID`

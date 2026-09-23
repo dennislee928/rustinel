@@ -69,22 +69,114 @@ window_secs = 60    # window length; repeats within this period are aggregated
 max_entries = 10000 # memory cap on distinct alert keys tracked simultaneously
 
 # 4. Active Response (Optional Prevention)
+#   Rustinel runs in user mode, so every action here happens after the operation
+#   that triggered it has already completed. Denying an operation outright needs
+#   a kernel driver, which Rustinel does not ship. See docs/active-response.md.
+#
+#   Start with prevention_enabled = false and read the audit records before
+#   turning it on.
 [response]
 enabled = false
-prevention_enabled = false
-min_severity = "critical"   # sigma: critical only; yara always treated as critical
+prevention_enabled = false  # false: select and record actions, perform none
+min_severity = "critical"   # only used when no [[response.rules]] are defined
 channel_capacity = 128
-# Processes that will never be terminated, matched by image basename or full path.
+# Processes that will never be acted on, matched by image basename or full path.
 # Complement the compiled-in path allowlist above for named system processes.
 #
 # Windows examples: smss.exe, csrss.exe, wininit.exe, lsass.exe, svchost.exe
 # Linux examples:  systemd, systemd-journald, sshd, dbus-daemon, auditd
 #
 # allowlist_images = []
+#
+# Additional never-act images, on top of the compiled-in list of processes whose
+# death takes the machine or the session with them.
+# protected_images = []
+max_actions_per_minute = 30 # ceiling per action kind; 0 disables the ceiling
+cooldown_secs = 60          # minimum gap between identical actions on one target
+audit_to_alerts = true      # write every attempted action to the alert stream
+# Where quarantined files are kept. Relative paths resolve next to this file.
+quarantine_directory = "quarantine"
+
+# 4.1 Per-action switches. An action runs only when it is enabled here AND
+#     selected by a rule below. Termination is on by default because it is what
+#     the engine did before policy rules existed; everything else is opt-in.
+[response.actions.terminate_process]
+enabled = true
+[response.actions.suspend_process]
+enabled = false             # freeze for triage instead of killing
+
+[response.actions.quarantine_file]
+enabled = false             # move a file out of reach, reversibly
+
+# These undo persistence after it is written; a kernel driver would refuse the
+# write instead. See docs/active-response.md.
+#
+# revert_registry and disable_scheduled_task are Windows only. disable_service
+# covers the Windows service control manager, systemd, and launchd - on macOS it
+# is the action that answers a LaunchAgent, because killing what one started
+# only makes launchd start it again.
+[response.actions.revert_registry]
+enabled = false
+[response.actions.disable_service]
+enabled = false
+[response.actions.disable_scheduled_task]
+enabled = false
+
+# Windows only: blocking one image's traffic needs a per-executable match, which
+# WFP has as ALE_APP_ID and neither nftables nor pf offers.
+[response.actions.block_process_network]
+enabled = false
+
+# Host isolation can strand a machine that is only reachable over the network
+# it just lost, so it refuses to run until something below says what must keep
+# working. Enforced by the kernel on all three platforms: WFP on Windows,
+# nftables on Linux, pf on macOS. `persistent` is Windows only - neither Unix
+# backend has an equivalent, so a reboot there restores network access.
+[response.actions.isolate_host]
+enabled = false
+persistent = true           # survive a reboot; fails closed
+allow_cidrs = []            # e.g. ["10.0.0.0/8"]; prefix lengths are honoured
+#                             loopback is always permitted, whatever this says
+allow_dns = true
+allow_dhcp = true
+
+# 4.2 Policy rules, evaluated in order; the first match decides. Every field
+#     that is set must match, and an unset field matches everything. Leave the
+#     whole list out to keep the pre-policy behaviour: terminate at or above
+#     min_severity.
+#
+# [[response.rules]]
+# name = "credential-access"
+# tags = ["attack.t1003*"]          # Sigma rule tags; * wildcards allowed
+# categories = ["process_access"]   # Sigma logsource category of the event
+# rule_ids = []                     # exact rule.id values (sigma::<uuid>)
+# rule_names = []                   # rule titles; * wildcards allowed
+# engines = ["sigma", "yara"]       # sigma, yara, ioc
+# min_severity = "high"
+# actions = ["suspend_process", "terminate_process"]
+# dry_run = false                   # can only tighten, never enable prevention
 
 # 5. Process Metadata Cache
 [process]
 max_entries = 65536 # maximum process records retained when exit events are missed
+
+# Hash the executable behind process-start and image-load events, filling the
+# Sysmon-style `Hashes` field (MD5=...,SHA256=...) that the public Sigma corpus
+# matches on. With this off, every rule matching on a hash still loads and sees
+# every event, and never fires.
+#
+# The hash is computed between the sensor channel and the detection engine,
+# because one that arrives later is one no rule can use. Repeats are cheap: the
+# cache is keyed by file identity and a machine runs the same few binaries over
+# and over. The size limit bounds the first-touch cost, since there is no
+# backpressure behind this thread - anything queued behind a slow hash is shed
+# rather than delayed.
+#
+# Signature fields (Signed, Signature, SignatureStatus) come with it where the
+# platform has an answer: Authenticode on Windows, the kernel's own code-signing
+# verdict on macOS. Linux has no equivalent, so those stay empty there.
+hash_images = true              # Windows, Linux, and macOS
+hash_max_file_size_mb = 64
 
 # 6. Behavioral Recording (rustinel capture)
 #   Recordings hold normalized events - command lines, file paths, destinations,

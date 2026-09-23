@@ -276,6 +276,43 @@ pub struct DnsEvent {
     pub process_start_time: u64,
 }
 
+/// A `ptrace(2)` attach, one process reaching into another.
+///
+/// Emitted on the process ring alongside [`ProcessEvent`], discriminated by
+/// `kind` at offset 16, which both structs share. Kept small and separate
+/// rather than widening `ProcessEvent`: a ptrace carries no argv, no image,
+/// and no comm of the *target*, so reusing the 832-byte layout would put 776
+/// bytes of zeroes on the ring for every attach.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PtraceEvent {
+    pub event_time_ns: u64,
+    pub source_seq: u64,
+    /// Always [`PROCESS_EVENT_KIND_PTRACE`]; shares an offset with
+    /// `ProcessEvent::kind` so the reader can tell them apart before it
+    /// decides which type to read.
+    pub kind: u32,
+    /// The process calling `ptrace`.
+    pub source_pid: u32,
+    /// The process being attached to.
+    pub target_pid: u32,
+    /// `PTRACE_ATTACH`, `PTRACE_SEIZE`, `PTRACE_PEEKDATA`, and so on.
+    pub request: u32,
+    /// Effective UID of the caller.
+    pub uid: u32,
+    pub _pad: u32,
+    /// Null-terminated caller name (`comm`).
+    pub comm: [u8; 16],
+    /// Sensor-minted identity for this execution of `source_pid`.
+    pub process_start_time: u64,
+}
+
+/// `kind` marking a [`PtraceEvent`] on the process ring.
+///
+/// 1 and 2 are exec and exit; this continues the same sequence so one reader
+/// can dispatch on a single field.
+pub const PROCESS_EVENT_KIND_PTRACE: u32 = 3;
+
 // ── Size assertions ──────────────────────────────────────────────────────────
 // These catch accidental struct layout divergence at compile time.
 
@@ -335,6 +372,19 @@ pub fn bytes_to_string(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+// PtraceEvent: 8+8+4+4+4+4+4+4+16+8. `kind` must stay at offset 16, where
+// `ProcessEvent::kind` also lives, because the ring reader dispatches on that
+// one field before it knows which struct it is holding.
+const _: () = assert!(
+    core::mem::size_of::<PtraceEvent>() == 64,
+    "PtraceEvent layout changed — update ebpf/src/events.rs to match"
+);
+const _: () = assert!(
+    core::mem::offset_of!(PtraceEvent, kind) == core::mem::offset_of!(ProcessEvent, kind)
+        && core::mem::offset_of!(PtraceEvent, kind) == 16,
+    "PtraceEvent::kind must share ProcessEvent::kind's offset; the ring reader      dispatches on it before choosing a type"
+);
+
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub mod mapping {
@@ -372,6 +422,10 @@ pub mod mapping {
             process_start_key: process_start_key(event.pid, event.process_start_time),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(bytes_to_string(&event.image)),
                 image_source: None,
                 image_truncated: (event.image_truncated != 0).then_some(true),
@@ -471,6 +525,14 @@ pub mod mapping {
             process_start_key: process_start_key(event.pid, event.process_start_time),
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                // Classified from the destination: staging elsewhere and
+                // renaming in is both atomic and quieter than writing a unit
+                // file or an rc line in place.
+                persistence_mechanism: crate::sensor::persistence::classify_for(
+                    Platform::Linux,
+                    &target_filename,
+                )
+                .map(|mechanism| mechanism.as_str().to_string()),
                 path_truncated: truncation_marker(event.flags, source_filename.is_some())
                     .map(str::to_string),
                 source_filename,

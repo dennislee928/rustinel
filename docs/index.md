@@ -45,8 +45,14 @@ is validated across supported versions.
 
 Rustinel is not a drop-in replacement for a mature commercial EDR. It provides
 no kernel-level self-protection, no pre-execution blocking, no anti-tamper
-guarantees, and no managed response or enterprise console. A sufficiently
-privileged attacker can interfere with user-mode telemetry.
+guarantees, and no managed response console. A sufficiently privileged attacker
+can interfere with user-mode telemetry.
+
+It does respond as well as detect, within that boundary: it can terminate or
+suspend the process behind an alert under operator-defined policy. Every such
+action happens after the operation that triggered it, because denying an
+operation outright needs a kernel driver. See
+[Active Response](active-response.md).
 
 That trade is deliberate. Rustinel uses telemetry the operating system already
 exposes rather than shipping a kernel driver, which costs visibility and

@@ -96,6 +96,10 @@ pub struct EcsAlert {
     #[serde(rename = "rule.id", skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
 
+    /// Detection rule tags, as written in the rule (`attack.t1003.001`).
+    #[serde(rename = "rule.tags", skip_serializing_if = "Vec::is_empty")]
+    pub rule_tags: Vec<String>,
+
     /// Detection severity (critical, high, medium, low)
     #[serde(rename = "edr.rule.severity")]
     pub edr_rule_severity: String,
@@ -192,6 +196,53 @@ pub struct EcsAlert {
         skip_serializing_if = "Option::is_none"
     )]
     pub process_file_version: Option<String>,
+
+    /// ECS `process.hash.md5`, lowercase hex.
+    ///
+    /// Split out of the Sysmon-style `Hashes` string the rules match on: ECS
+    /// wants one algorithm per field in lowercase, and a SIEM correlating
+    /// against threat intelligence looks here rather than inside a combined
+    /// string.
+    #[serde(rename = "process.hash.md5", skip_serializing_if = "Option::is_none")]
+    pub process_hash_md5: Option<String>,
+
+    /// ECS `process.hash.sha256`, lowercase hex.
+    #[serde(
+        rename = "process.hash.sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_hash_sha256: Option<String>,
+
+    /// ECS `process.code_signature.exists`: whether a signature was found.
+    #[serde(
+        rename = "process.code_signature.exists",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_exists: Option<bool>,
+
+    /// ECS `process.code_signature.valid`: whether it verified.
+    ///
+    /// Distinct from `exists`: a tampered binary has a signature that does not
+    /// verify, which is a stronger signal than having none at all.
+    #[serde(
+        rename = "process.code_signature.valid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_valid: Option<bool>,
+
+    /// ECS `process.code_signature.subject_name`: who signed it.
+    #[serde(
+        rename = "process.code_signature.subject_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_subject_name: Option<String>,
+
+    /// ECS `process.code_signature.status`: why it was or was not accepted.
+    #[serde(
+        rename = "process.code_signature.status",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub process_code_signature_status: Option<String>,
 
     #[serde(rename = "user.name", skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
@@ -477,6 +528,37 @@ pub struct EcsAlert {
         skip_serializing_if = "Option::is_none"
     )]
     pub edr_remote_thread_start_module: Option<String>,
+
+    /// Process whose handle was requested.
+    #[serde(
+        rename = "edr.process_access.target_pid",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_target_pid: Option<u64>,
+
+    /// Image of the process whose handle was requested.
+    #[serde(
+        rename = "edr.process_access.target_image",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_target_image: Option<String>,
+
+    /// Access mask requested, formatted as Sysmon writes it (`0x1010`).
+    ///
+    /// Windows reports the requested access and grants at most that, so this
+    /// is an upper bound on what the caller received.
+    #[serde(
+        rename = "edr.process_access.granted_access",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_granted_access: Option<String>,
+
+    /// Thread whose handle was requested, when the access was to a thread.
+    #[serde(
+        rename = "edr.process_access.target_thread_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub edr_process_access_target_thread_id: Option<u64>,
 
     #[serde(
         rename = "edr.remote_thread.start_function",

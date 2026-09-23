@@ -163,6 +163,7 @@ async fn live_protection_does_not_write_a_recording() {
             channel_capacity: 4,
             allowlist_images: Vec::new(),
             allowlist_paths: Vec::new(),
+            ..ResponseConfig::default()
         })),
     ));
 

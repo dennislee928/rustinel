@@ -59,6 +59,12 @@ impl Normalizer {
                 self.normalize_registry(event, fields.clone(), &mut provenance)
             }
             SensorPayload::ImageLoad(fields) => self.normalize_image_load(fields.clone()),
+            SensorPayload::RemoteThread(fields) => {
+                self.normalize_remote_thread(fields.clone(), &mut provenance)
+            }
+            SensorPayload::ProcessAccess(fields) => {
+                self.normalize_process_access(fields.clone(), &mut provenance)
+            }
             SensorPayload::Scripting(fields) => self.normalize_powershell(fields.clone()),
             SensorPayload::PowerShellModule(fields) => {
                 self.normalize_powershell_module(fields.clone())
@@ -301,6 +307,76 @@ impl Normalizer {
             .get_metadata_by_key(key.pid, key.start_time)
     }
 
+    /// Fill in the two images of a cross-process event.
+    ///
+    /// The record names both peers by bare PID, so both images come from the
+    /// process cache and are marked derived. An image that cannot be resolved
+    /// is left empty rather than guessed at: a rule that matches on the wrong
+    /// image is worse than one that does not match.
+    fn normalize_remote_thread(
+        &self,
+        mut fields: RemoteThreadFields,
+        provenance: &mut Provenance,
+    ) -> Option<EventFields> {
+        self.resolve_peer_image(
+            &mut fields.source_image,
+            fields.source_process_id.as_deref(),
+            "SourceImage",
+            provenance,
+        );
+        self.resolve_peer_image(
+            &mut fields.target_image,
+            fields.target_process_id.as_deref(),
+            "TargetImage",
+            provenance,
+        );
+
+        Some(EventFields::RemoteThread(fields))
+    }
+
+    fn normalize_process_access(
+        &self,
+        mut fields: ProcessAccessFields,
+        provenance: &mut Provenance,
+    ) -> Option<EventFields> {
+        self.resolve_peer_image(
+            &mut fields.source_image,
+            fields.source_process_id.as_deref(),
+            "SourceImage",
+            provenance,
+        );
+        self.resolve_peer_image(
+            &mut fields.target_image,
+            fields.target_process_id.as_deref(),
+            "TargetImage",
+            provenance,
+        );
+
+        Some(EventFields::ProcessAccess(fields))
+    }
+
+    /// Resolve one peer of a cross-process event from its PID.
+    fn resolve_peer_image(
+        &self,
+        image: &mut Option<String>,
+        process_id: Option<&str>,
+        field: &'static str,
+        provenance: &mut Provenance,
+    ) {
+        if image.is_some() {
+            return;
+        }
+
+        let Some(pid) = process_id.and_then(|value| value.parse::<u32>().ok()) else {
+            return;
+        };
+
+        if let Some(resolved) = self.process_cache.get_image_by_pid(pid) {
+            *image = Some(convert_nt_to_dos(&resolved));
+            provenance.mark_derived(field);
+        }
+    }
+
     fn resolve_user_field(&self, user: &mut Option<String>) {
         let sid = match user.as_deref() {
             Some(value) if value.starts_with("S-1-") => value.to_string(),
@@ -510,6 +586,10 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some("/usr/bin/curl".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -555,6 +635,10 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: None,
                 image_source: None,
                 image_truncated: None,
@@ -627,6 +711,7 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some("/tmp/sample.txt".to_string()),
                 process_id: Some(pid.to_string()),
@@ -694,6 +779,10 @@ mod tests {
             }),
             parent_process_start_key: None,
             payload: SensorPayload::Process(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: None,
                 image_source: None,
                 image_truncated: None,
@@ -822,6 +911,7 @@ mod tests {
             process_start_key: None,
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some("/tmp/test".to_string()),
                 process_id: Some("9".to_string()),
@@ -876,6 +966,7 @@ mod tests {
             process_start_key: None,
             parent_process_start_key: None,
             payload: SensorPayload::File(FileEventFields {
+                persistence_mechanism: None,
                 source_filename: None,
                 target_filename: Some("/tmp/test".to_string()),
                 process_id: Some("9".to_string()),

@@ -10,8 +10,9 @@ use common::{
 use rustinel::models::{
     Alert, AlertSeverity, DetectionEngine, DnsQueryFields, EventCategory, EventFields,
     FileEventFields, ImageLoadFields, NetworkConnectionFields, NormalizedEvent,
-    PowerShellModuleFields, PowerShellScriptFields, ProcessCreationFields, RegistryEventFields,
-    SecurityAuditFields, ServiceCreationFields, TaskCreationFields, WmiEventFields,
+    PowerShellModuleFields, PowerShellScriptFields, ProcessAccessFields, ProcessCreationFields,
+    RegistryEventFields, RemoteThreadFields, SecurityAuditFields, ServiceCreationFields,
+    TaskCreationFields, WmiEventFields,
 };
 use rustinel::sensor::{Platform, ProcessStartKey, SensorPayload};
 use serde_json::json;
@@ -31,6 +32,7 @@ fn alert(category: EventCategory, event_id: u16, opcode: u8, fields: EventFields
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             source_seq: None,
@@ -135,6 +137,10 @@ fn ecs_category_coverage_maps_event_contract_fields() {
                 1,
                 1,
                 EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                     image_source: None,
                     image_truncated: None,
@@ -191,6 +197,7 @@ fn ecs_category_coverage_maps_event_contract_fields() {
                 11,
                 64,
                 EventFields::FileEvent(FileEventFields {
+                    persistence_mechanism: None,
                     source_filename: None,
                     target_filename: Some(r"C:\Temp\payload.dll".to_string()),
                     process_id: Some("111".to_string()),
@@ -254,6 +261,8 @@ fn ecs_category_coverage_maps_event_contract_fields() {
                 7,
                 10,
                 EventFields::ImageLoad(ImageLoadFields {
+                    hashes: None,
+                    signature_status: None,
                     image_loaded: Some(r"C:\Temp\payload.dll".to_string()),
                     process_id: Some("111".to_string()),
                     image: Some(r"C:\Windows\System32\rundll32.exe".to_string()),
@@ -456,6 +465,7 @@ fn macos_file_create_alert_maps_ecs_fields() {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: normalized,
         match_details: None,
     };
@@ -497,6 +507,10 @@ fn ecs_version_field_is_9_4_0() {
         1,
         1,
         EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
             image_source: None,
             image_truncated: None,
@@ -528,6 +542,10 @@ fn ecs_process_image_truncation_marker_is_preserved() {
         1,
         1,
         EventFields::ProcessCreation(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(long_prefix),
             image_source: None,
             image_truncated: Some(true),
@@ -561,6 +579,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: Some("sigma::abc-123".to_string()),
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             source_seq: None,
@@ -572,6 +591,10 @@ fn test_rule_id_mapping_and_omit_behavior() {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -606,6 +629,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Sigma,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
@@ -622,6 +646,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: Some("yara::yara-rule-uuid".to_string()),
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
@@ -635,6 +660,7 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
@@ -651,9 +677,137 @@ fn test_rule_id_mapping_and_omit_behavior() {
         rule_description: None,
         rule_id: Some("ioc::domain::example.com".to_string()),
         engine: DetectionEngine::Ioc,
+        tags: Vec::new(),
         event: alert_sigma_with_id.event.clone(),
         match_details: None,
     };
     let json_ioc = ecs_json(&alert_ioc);
     assert_ecs_field_eq(&json_ioc, "rule.id", "ioc::domain::example.com");
+}
+
+#[test]
+fn remote_thread_alert_names_the_injector_as_the_process() {
+    // The process fields must describe the *source*: an analyst reading
+    // `process.executable` on an injection alert needs the injector, and
+    // response acts on the same value. The victim is the target.
+    let alert = alert(
+        EventCategory::RemoteThread,
+        8,
+        0,
+        EventFields::RemoteThread(RemoteThreadFields {
+            source_process_id: Some("4242".to_string()),
+            source_image: Some(r"C:\tmp\injector.exe".to_string()),
+            target_process_id: Some("1000".to_string()),
+            target_image: Some(r"C:\Windows\System32\lsass.exe".to_string()),
+            start_address: Some("0x00007FFB12340000".to_string()),
+            start_module: None,
+            start_function: None,
+            user: None,
+        }),
+    );
+    let json = ecs_json(&alert);
+
+    assert_ecs_field_eq(&json, "event.dataset", "edr.remote_thread");
+    assert_ecs_field_eq(&json, "event.category", json!(["process"]));
+    assert_ecs_field_eq(&json, "event.action", "remote-thread-create");
+    assert_ecs_field_eq(&json, "process.executable", r"C:\tmp\injector.exe");
+    assert_ecs_field_eq(&json, "process.pid", 4242);
+    assert_ecs_field_eq(&json, "edr.remote_thread.target_pid", 1000);
+    assert_ecs_field_eq(
+        &json,
+        "edr.remote_thread.target_image",
+        r"C:\Windows\System32\lsass.exe",
+    );
+    assert_ecs_field_eq(
+        &json,
+        "edr.remote_thread.start_address",
+        "0x00007FFB12340000",
+    );
+}
+
+#[test]
+fn process_access_alert_carries_the_target_and_the_requested_access() {
+    let alert = alert(
+        EventCategory::ProcessAccess,
+        10,
+        0,
+        EventFields::ProcessAccess(ProcessAccessFields {
+            access_method: None,
+            source_process_id: Some("4242".to_string()),
+            source_image: Some(r"C:\tmp\dumper.exe".to_string()),
+            target_process_id: Some("1000".to_string()),
+            target_image: Some(r"C:\Windows\System32\lsass.exe".to_string()),
+            granted_access: Some("0x1010".to_string()),
+            target_thread_id: None,
+            user: None,
+        }),
+    );
+    let json = ecs_json(&alert);
+
+    assert_ecs_field_eq(&json, "event.dataset", "edr.process_access");
+    assert_ecs_field_eq(&json, "event.category", json!(["process"]));
+    assert_ecs_field_eq(&json, "event.type", json!(["access"]));
+    assert_ecs_field_eq(&json, "event.action", "process-access");
+    // Source again: the caller is the subject of the event.
+    assert_ecs_field_eq(&json, "process.executable", r"C:\tmp\dumper.exe");
+    assert_ecs_field_eq(&json, "process.pid", 4242);
+    assert_ecs_field_eq(&json, "edr.process_access.target_pid", 1000);
+    assert_ecs_field_eq(
+        &json,
+        "edr.process_access.target_image",
+        r"C:\Windows\System32\lsass.exe",
+    );
+    assert_ecs_field_eq(&json, "edr.process_access.granted_access", "0x1010");
+    // Absent on a process open; only OpenThread carries it.
+    assert!(json.get("edr.process_access.target_thread_id").is_none());
+}
+
+#[test]
+fn cross_process_alerts_resolve_the_generic_field_names_to_the_source() {
+    // Stock SigmaHQ rules read `Image` and `ProcessId` on both families as
+    // often as they read the explicit Source* names. Both must resolve to the
+    // caller, or a rule matching on `Image` would be testing the victim.
+    let injection = alert(
+        EventCategory::RemoteThread,
+        8,
+        0,
+        EventFields::RemoteThread(RemoteThreadFields {
+            source_process_id: Some("4242".to_string()),
+            source_image: Some(r"C:\tmp\injector.exe".to_string()),
+            target_process_id: Some("1000".to_string()),
+            target_image: Some(r"C:\Windows\System32\lsass.exe".to_string()),
+            start_address: None,
+            start_module: None,
+            start_function: None,
+            user: None,
+        }),
+    );
+    assert_eq!(
+        injection.event.get_field("Image"),
+        Some(r"C:\tmp\injector.exe")
+    );
+    assert_eq!(injection.event.get_field("ProcessId"), Some("4242"));
+    assert_eq!(
+        injection.event.get_field("TargetImage"),
+        Some(r"C:\Windows\System32\lsass.exe")
+    );
+
+    let access = alert(
+        EventCategory::ProcessAccess,
+        10,
+        0,
+        EventFields::ProcessAccess(ProcessAccessFields {
+            access_method: None,
+            source_process_id: Some("4242".to_string()),
+            source_image: Some(r"C:\tmp\dumper.exe".to_string()),
+            target_process_id: Some("1000".to_string()),
+            target_image: Some(r"C:\Windows\System32\lsass.exe".to_string()),
+            granted_access: Some("0x1010".to_string()),
+            target_thread_id: None,
+            user: None,
+        }),
+    );
+    assert_eq!(access.event.get_field("Image"), Some(r"C:\tmp\dumper.exe"));
+    assert_eq!(access.event.get_field("ProcessId"), Some("4242"));
+    assert_eq!(access.event.get_field("GrantedAccess"), Some("0x1010"));
 }

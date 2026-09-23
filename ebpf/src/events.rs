@@ -82,6 +82,44 @@ pub struct ProcessEvent {
     pub process_start_time: u64,
 }
 
+
+/// `kind` marking a [`PtraceEvent`] on the process ring.
+///
+/// 1 and 2 are exec and exit; this continues the same sequence so one reader
+/// can dispatch on a single field.
+pub const PROCESS_EVENT_KIND_PTRACE: u32 = 3;
+
+/// A `ptrace(2)` attach, one process reaching into another.
+///
+/// Emitted on the process ring alongside [`ProcessEvent`], discriminated by
+/// `kind` at offset 16, which both structs share. Kept small and separate
+/// rather than widening `ProcessEvent`: a ptrace carries no argv, no image,
+/// and no comm of the *target*, so reusing the 832-byte layout would put 776
+/// bytes of zeroes on the ring for every attach.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PtraceEvent {
+    pub event_time_ns: u64,
+    pub source_seq: u64,
+    /// Always [`PROCESS_EVENT_KIND_PTRACE`]; shares an offset with
+    /// `ProcessEvent::kind` so the reader can tell them apart before it
+    /// decides which type to read.
+    pub kind: u32,
+    /// The process calling `ptrace`.
+    pub source_pid: u32,
+    /// The process being attached to.
+    pub target_pid: u32,
+    /// `PTRACE_ATTACH`, `PTRACE_SEIZE`, `PTRACE_PEEKDATA`, and so on.
+    pub request: u32,
+    /// Effective UID of the caller.
+    pub uid: u32,
+    pub _pad: u32,
+    /// Null-terminated caller name (`comm`).
+    pub comm: [u8; 16],
+    /// Sensor-minted identity for this execution of `source_pid`.
+    pub process_start_time: u64,
+}
+
 /// `connect(2)` succeeded — the connection is established.
 pub const CONNECT_RESULT_OK: i32 = 0;
 

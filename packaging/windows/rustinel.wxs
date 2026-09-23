@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Rustinel Windows installer.
+
+  Builds an x64 per-machine MSI that lays down the agent, its configuration,
+  and the Windows service, and takes all three away again on uninstall.
+
+  Two decisions are worth knowing before reading further.
+
+  The service is installed by the MSI rather than by `rustinel service install`.
+  An MSI that does not own the service cannot roll it back on a failed install,
+  cannot stop it before replacing the binary on upgrade, and leaves it behind on
+  uninstall. The in-binary command still exists for portable installs, where
+  there is no MSI to own anything. The two must agree on the service name and
+  arguments, which is what the ServiceInstall element below mirrors from
+  `src/platform/windows.rs`.
+
+  The configuration file is never overwritten. An upgrade that replaces
+  config.toml would silently discard every rule, allowlist, and response policy
+  the operator wrote, which is the single worst thing an agent upgrade can do.
+  The component is marked NeverOverwrite and Permanent: the file is written once
+  on first install and left alone by every upgrade and by uninstall.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <?define ProductName = "Rustinel" ?>
+  <?define Manufacturer = "Rustinel" ?>
+  <!--
+    Never change this GUID. Windows uses it to recognise that a new MSI
+    upgrades an existing install rather than sitting beside it; a changed
+    UpgradeCode gives every machine two Rustinels, two services, and one
+    working agent.
+  -->
+  <?define UpgradeCode = "7B0E4C2A-9D31-4F58-A6E7-2C15D8B34F90" ?>
+
+  <Package Name="$(ProductName)"
+           Manufacturer="$(Manufacturer)"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Language="1033"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="Rustinel endpoint detection and response agent"
+                        Manufacturer="$(Manufacturer)" />
+
+    <!--
+      Block downgrades with a message rather than letting a newer install be
+      silently replaced by an older one.
+    -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of $(ProductName) is already installed. Uninstall it before installing this one." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Launch Condition="VersionNT64"
+            Message="$(ProductName) requires 64-bit Windows." />
+    <Launch Condition="Privileged"
+            Message="$(ProductName) must be installed by an administrator; it registers a Windows service." />
+
+    <Icon Id="RustinelIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="RustinelIcon" />
+    <Property Id="ARPHELPLINK" Value="https://docs.rustinel.io/" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Karib0u/rustinel" />
+    <!-- The agent has no UI; offering "repair" in Add/Remove Programs only
+         invites a confusing half-reinstall of a running service. -->
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseFile)" />
+
+    <Feature Id="Main" Title="Rustinel Agent" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="AgentComponents" />
+      <ComponentGroupRef Id="DataComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="$(ProductName)" />
+    </StandardDirectory>
+
+    <!--
+      Configuration, rules, logs, captures, and quarantine live under
+      ProgramData rather than Program Files: the service writes to all of them,
+      and a service writing into its own program directory is both a Windows
+      convention violation and a way for a compromised agent to modify its own
+      binary directory.
+    -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="$(ProductName)">
+        <Directory Id="RULESFOLDER" Name="rules" />
+        <Directory Id="LOGSFOLDER" Name="logs" />
+        <Directory Id="QUARANTINEFOLDER" Name="quarantine" />
+        <Directory Id="STATEFOLDER" Name="state" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="AgentComponents" Directory="INSTALLFOLDER">
+      <Component Id="RustinelExe" Guid="*" Bitness="always64">
+        <File Id="rustinel.exe"
+              Source="$(var.BinaryFile)"
+              KeyPath="yes" />
+
+        <!--
+          Mirrors src/platform/windows.rs: the same name, the same arguments.
+          A mismatch here produces a service that starts and immediately looks
+          for a configuration file that is not there.
+        -->
+        <ServiceInstall Id="RustinelServiceInstall"
+                        Name="Rustinel"
+                        DisplayName="Rustinel ETW Sentinel"
+                        Description="High-performance endpoint detection agent"
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="run --config &quot;[DATAFOLDER]config.toml&quot; --no-console"
+                        Vital="yes">
+          <!-- Restart twice on failure, then stop trying. An agent that
+               crash-loops forever is worse than one that is visibly stopped. -->
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="none"
+                              RestartServiceDelayInSeconds="60" />
+        </ServiceInstall>
+
+        <!--
+          Stop before removing or replacing, start after installing. Without
+          the stop on uninstall the binary is locked and the uninstall leaves
+          files behind; without it on upgrade the new binary cannot be written.
+        -->
+        <ServiceControl Id="RustinelServiceControl"
+                        Name="Rustinel"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="DataComponents">
+      <!--
+        The operator's configuration. Written once and never touched again:
+        Permanent survives uninstall, NeverOverwrite survives upgrade. Losing
+        this file would discard every rule path, allowlist, and response policy
+        the operator set.
+      -->
+      <Component Id="ConfigFile"
+                 Directory="DATAFOLDER"
+                 Guid="6E2A94C7-5B18-4D3E-9F07-A1D2E45C8B63"
+                 Permanent="yes"
+                 NeverOverwrite="yes"
+                 Bitness="always64">
+        <File Id="config.toml"
+              Source="$(var.ConfigFile)"
+              Name="config.toml"
+              KeyPath="yes" />
+      </Component>
+
+      <!--
+        The directories the agent writes into, created empty and removed on
+        uninstall only if they are empty. Alerts and quarantined files are
+        deliberately left behind: an uninstall is not consent to destroy an
+        incident record.
+      -->
+      <Component Id="DataFolders"
+                 Directory="DATAFOLDER"
+                 Guid="B41F7D06-2E9C-4A85-BC13-70F8A9E6D452"
+                 Bitness="always64">
+        <CreateFolder Directory="RULESFOLDER" />
+        <CreateFolder Directory="LOGSFOLDER" />
+        <CreateFolder Directory="STATEFOLDER" />
+        <RegistryValue Root="HKLM"
+                       Key="SOFTWARE\$(Manufacturer)\$(ProductName)"
+                       Name="DataDirectory"
+                       Type="string"
+                       Value="[DATAFOLDER]"
+                       KeyPath="yes" />
+      </Component>
+
+      <!--
+        Quarantine holds live malware, so it is locked down at install time
+        rather than inheriting whatever ProgramData allows. The agent tightens
+        this again at runtime; doing it here means the directory is never
+        briefly world-readable between install and first quarantine.
+      -->
+      <Component Id="QuarantineFolder"
+                 Directory="QUARANTINEFOLDER"
+                 Guid="D93C6B10-8F47-42A9-B5E6-1C0847A3F9D2"
+                 Bitness="always64">
+        <CreateFolder>
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM"
+                       Key="SOFTWARE\$(Manufacturer)\$(ProductName)"
+                       Name="QuarantineDirectory"
+                       Type="string"
+                       Value="[QUARANTINEFOLDER]"
+                       KeyPath="yes" />
+      </Component>
+
+      <!-- Version, for anything that wants to know what is installed without
+           parsing the MSI database. -->
+      <Component Id="VersionKey"
+                 Directory="DATAFOLDER"
+                 Guid="A05B8E31-C7D4-4F62-8A19-3E6D2B04C7F8"
+                 Bitness="always64">
+        <RegistryValue Root="HKLM"
+                       Key="SOFTWARE\$(Manufacturer)\$(ProductName)"
+                       Name="Version"
+                       Type="string"
+                       Value="$(var.ProductVersion)"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

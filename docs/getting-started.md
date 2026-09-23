@@ -6,7 +6,20 @@ Install Rustinel, run it, and see your first alert.
 
 === "Windows"
 
-    From an elevated PowerShell:
+    Download the signed installer from the
+    [latest release](https://github.com/Karib0u/rustinel/releases/latest) and
+    run it from an elevated prompt:
+
+    ```powershell
+    msiexec /i rustinel-<version>-x86_64.msi
+    ```
+
+    It registers the service, creates `C:\ProgramData\Rustinel`, and leaves
+    your configuration alone on every later upgrade. See
+    [Windows Installer](windows-installer.md) for silent installs, what lands
+    where, and how to verify the signature.
+
+    Or, to install the portable build with a script:
 
     ```powershell
     Invoke-WebRequest https://rustinel.io/install.ps1 -OutFile install-rustinel.ps1

@@ -31,6 +31,7 @@ fn alert_sink_writes_single_valid_ecs_ndjson_line() {
             rule_description: Some("process test alert".to_string()),
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event,
             match_details: None,
         };

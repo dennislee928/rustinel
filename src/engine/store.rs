@@ -29,6 +29,10 @@ pub(crate) struct RuleStore {
     /// Rule id or title to the raw detection condition. RSigma result headers
     /// do not carry it, so it is captured for match-debug output.
     conditions: HashMap<String, String>,
+    /// Rule id or title to the rule's tags. RSigma result headers do not carry
+    /// them either, and the response policy selects on technique, so they are
+    /// captured here alongside the description.
+    tags: HashMap<String, Vec<String>>,
     /// `(effective_id, title)` pairs assigned to named rules that had no ID.
     /// RSigma uses the ID field to route detection results into correlations,
     /// so these IDs are removed again before Rustinel builds an alert.
@@ -49,6 +53,7 @@ impl RuleStore {
             counts: HashMap::new(),
             descriptions: HashMap::new(),
             conditions: HashMap::new(),
+            tags: HashMap::new(),
             synthetic_detection_ids: std::collections::HashSet::new(),
         }
     }
@@ -139,6 +144,7 @@ impl RuleStore {
                 .entry(logsource_key(&rule.logsource))
                 .or_default() += 1;
             self.remember_description(rule.id.as_deref(), &rule.title, &rule.description);
+            self.remember_tags(rule.id.as_deref(), &rule.title, &rule.tags);
             if let Some(condition) = rule.detection.condition_strings.first() {
                 self.remember_condition(rule.id.as_deref(), &rule.title, condition);
             }
@@ -148,6 +154,11 @@ impl RuleStore {
                 correlation.id.as_deref(),
                 &correlation.title,
                 &correlation.description,
+            );
+            self.remember_tags(
+                correlation.id.as_deref(),
+                &correlation.title,
+                &correlation.tags,
             );
         }
 
@@ -172,6 +183,17 @@ impl RuleStore {
             .insert(title.to_string(), description.clone());
     }
 
+    fn remember_tags(&mut self, id: Option<&str>, title: &str, tags: &[String]) {
+        if tags.is_empty() {
+            return;
+        }
+
+        if let Some(id) = id {
+            self.tags.insert(id.to_string(), tags.to_vec());
+        }
+        self.tags.insert(title.to_string(), tags.to_vec());
+    }
+
     fn remember_condition(&mut self, id: Option<&str>, title: &str, condition: &str) {
         if let Some(id) = id {
             self.conditions
@@ -190,6 +212,15 @@ impl RuleStore {
             .and_then(|id| self.descriptions.get(id))
             .or_else(|| self.descriptions.get(rule_title))
             .cloned()
+    }
+
+    /// Tags declared by the rule, empty when it declares none.
+    pub(crate) fn tags_for(&self, rule_id: Option<&str>, rule_title: &str) -> Vec<String> {
+        rule_id
+            .and_then(|id| self.tags.get(id))
+            .or_else(|| self.tags.get(rule_title))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn condition_for(&self, rule_id: Option<&str>, rule_title: &str) -> Option<String> {

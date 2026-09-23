@@ -19,6 +19,9 @@ pub(super) fn ecs_event_category(category: EventCategory, event_id: u16) -> Vec<
         EventCategory::Registry => vec!["registry".to_string()],
         EventCategory::Dns => vec!["network".to_string()],
         EventCategory::ImageLoad => vec!["library".to_string()],
+        // ECS has no injection category; both are process manipulation.
+        EventCategory::RemoteThread => vec!["process".to_string()],
+        EventCategory::ProcessAccess => vec!["process".to_string()],
         EventCategory::Scripting => vec!["process".to_string()],
         EventCategory::PowerShellModule => vec!["process".to_string()],
         EventCategory::Wmi => vec!["api".to_string()],
@@ -66,6 +69,8 @@ pub(super) fn ecs_event_type(category: EventCategory, opcode: u8, event_id: u16)
             _ => vec!["info".to_string()],
         },
         EventCategory::Network => vec!["connection".to_string()],
+        EventCategory::RemoteThread => vec!["start".to_string()],
+        EventCategory::ProcessAccess => vec!["access".to_string()],
         EventCategory::File => match opcode {
             64 => vec!["creation".to_string()],
             70 | 72 => vec!["deletion".to_string()],
@@ -118,6 +123,8 @@ pub(super) fn ecs_event_action(
             _ => "process-info",
         },
         EventCategory::Network => "network-connection",
+        EventCategory::RemoteThread => "remote-thread-create",
+        EventCategory::ProcessAccess => "process-access",
         EventCategory::File => match opcode {
             64 => "file-create",
             70 | 72 => "file-delete",
@@ -170,6 +177,8 @@ pub(super) fn event_dataset(category: EventCategory) -> String {
         EventCategory::Registry => "registry",
         EventCategory::Dns => "dns",
         EventCategory::ImageLoad => "library",
+        EventCategory::RemoteThread => "remote_thread",
+        EventCategory::ProcessAccess => "process_access",
         EventCategory::Scripting => "scripting",
         EventCategory::PowerShellModule => "powershell_module",
         EventCategory::Wmi => "wmi",

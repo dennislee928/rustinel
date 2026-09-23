@@ -3,6 +3,9 @@
 ebpf/target/
 **/*.rs.bk
 
+# Packaging output
+/dist/
+
 # IDE / Editor files
 .vscode/
 .idea/
@@ -50,3 +53,26 @@ tests/**/*
 rules-bench/
 *.pyc
 __pycache__/
+
+# Certificates, secrets, and keys - NEVER commit these
+certs/
+.certs/
+*.pem
+*.crt
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+*.cer
+*.cert
+.env
+.env.local
+secrets.json
+*.secret
+*_secret*
+.ssh/
+.aws/
+.azure/
+*.bundle
+bundle.pem

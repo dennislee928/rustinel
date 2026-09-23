@@ -360,15 +360,223 @@ pub struct AlertConfig {
     pub match_debug: MatchDebugLevel,
 }
 
-/// Active response configuration (optional prevention/termination)
+/// Active response configuration (optional prevention/containment)
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponseConfig {
     pub enabled: bool,
+    /// Master switch. While false every selected action is reported but not
+    /// performed, which is the dry run every deployment should start with.
     pub prevention_enabled: bool,
+    /// Severity floor. Consulted only when `rules` is empty, in which case the
+    /// engine behaves exactly as it did before policy rules existed: terminate
+    /// the offending process at or above this severity.
     pub min_severity: String,
     pub channel_capacity: usize,
     pub allowlist_images: Vec<String>,
     pub allowlist_paths: Vec<String>,
+    /// Images that are never acted on, added to the compiled-in list of
+    /// processes whose termination would take the machine down with them.
+    #[serde(default)]
+    pub protected_images: Vec<String>,
+    /// Ceiling on actions of one kind per minute, a brake on a rule that
+    /// matches far more often than its author expected.
+    #[serde(default = "default_max_actions_per_minute")]
+    pub max_actions_per_minute: u32,
+    /// Minimum gap between two identical actions on the same target.
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Whether to write a record of every attempted action to the alert stream.
+    #[serde(default = "default_true")]
+    pub audit_to_alerts: bool,
+    /// Where quarantined files are kept. Relative paths resolve next to the
+    /// configuration file, as the log and rule directories do.
+    #[serde(default = "default_quarantine_directory")]
+    pub quarantine_directory: PathBuf,
+    /// Per-action switches. An action must be enabled here *and* selected by a
+    /// rule before it will run.
+    #[serde(default)]
+    pub actions: ResponseActionsConfig,
+    /// Policy rules, evaluated in order; the first match decides. Leave empty
+    /// to keep the pre-policy behaviour described on `min_severity`.
+    #[serde(default)]
+    pub rules: Vec<ResponseRule>,
+}
+
+fn default_quarantine_directory() -> PathBuf {
+    PathBuf::from("quarantine")
+}
+
+fn default_max_actions_per_minute() -> u32 {
+    30
+}
+
+fn default_cooldown_secs() -> u64 {
+    60
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ResponseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prevention_enabled: false,
+            min_severity: "critical".to_string(),
+            channel_capacity: 128,
+            allowlist_images: Vec::new(),
+            allowlist_paths: Vec::new(),
+            protected_images: Vec::new(),
+            max_actions_per_minute: default_max_actions_per_minute(),
+            cooldown_secs: default_cooldown_secs(),
+            audit_to_alerts: true,
+            quarantine_directory: default_quarantine_directory(),
+            actions: ResponseActionsConfig::default(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// Whether one action kind may run at all.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ActionToggle {
+    pub enabled: bool,
+}
+
+impl ActionToggle {
+    /// Enabled by default.
+    pub fn on() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Disabled by default.
+    pub fn off() -> Self {
+        Self { enabled: false }
+    }
+}
+
+impl Default for ActionToggle {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+/// Per-action switches.
+///
+/// Termination is on by default because it is what the engine already did.
+/// Everything else is opt-in: an action that can cut a host off the network or
+/// move a file out from under a running program should never turn itself on
+/// because a rule pack mentioned it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResponseActionsConfig {
+    #[serde(default = "ActionToggle::on")]
+    pub terminate_process: ActionToggle,
+    #[serde(default = "ActionToggle::off")]
+    pub suspend_process: ActionToggle,
+    #[serde(default)]
+    pub isolate_host: IsolationConfig,
+    #[serde(default = "ActionToggle::off")]
+    pub block_process_network: ActionToggle,
+    #[serde(default = "ActionToggle::off")]
+    pub quarantine_file: ActionToggle,
+    #[serde(default = "ActionToggle::off")]
+    pub revert_registry: ActionToggle,
+    #[serde(default = "ActionToggle::off")]
+    pub disable_service: ActionToggle,
+    #[serde(default = "ActionToggle::off")]
+    pub disable_scheduled_task: ActionToggle,
+}
+
+impl Default for ResponseActionsConfig {
+    fn default() -> Self {
+        Self {
+            terminate_process: ActionToggle::on(),
+            suspend_process: ActionToggle::off(),
+            isolate_host: IsolationConfig::default(),
+            block_process_network: ActionToggle::off(),
+            quarantine_file: ActionToggle::off(),
+            revert_registry: ActionToggle::off(),
+            disable_service: ActionToggle::off(),
+            disable_scheduled_task: ActionToggle::off(),
+        }
+    }
+}
+
+/// Host isolation, and what must keep working while a host is isolated.
+///
+/// The exception list is not a convenience. Isolation refuses to run while it
+/// is empty, because cutting off a machine that is only reachable over the
+/// network it just lost is an outage the agent cannot undo remotely.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IsolationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether the filters survive a reboot.
+    ///
+    /// Persistent filters fail closed: a host stays isolated even if the agent
+    /// never starts again. That is the safe direction for containment and the
+    /// dangerous one for reachability.
+    #[serde(default = "default_true")]
+    pub persistent: bool,
+    /// Addresses and networks that stay reachable, such as the management
+    /// range an analyst would connect from.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    /// Keep name resolution working.
+    #[serde(default = "default_true")]
+    pub allow_dns: bool,
+    /// Keep DHCP working, so the lease can still be renewed.
+    #[serde(default = "default_true")]
+    pub allow_dhcp: bool,
+}
+
+impl Default for IsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            persistent: true,
+            allow_cidrs: Vec::new(),
+            allow_dns: true,
+            allow_dhcp: true,
+        }
+    }
+}
+
+/// One policy rule: which alerts it covers, and what to do about them.
+///
+/// Every populated field must match for the rule to apply. An empty field
+/// matches everything, so a rule with only `actions` set is a catch-all.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResponseRule {
+    /// Operator label, used in logs and audit records.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Exact detection rule IDs, as they appear in `rule.id` (`sigma::<uuid>`).
+    #[serde(default)]
+    pub rule_ids: Vec<String>,
+    /// Detection rule names; `*` wildcards allowed.
+    #[serde(default)]
+    pub rule_names: Vec<String>,
+    /// Sigma rule tags; `*` wildcards allowed (`attack.t1003*`).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Sigma logsource categories of the triggering event (`process_access`).
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Detection engines: `sigma`, `yara`, `ioc`.
+    #[serde(default)]
+    pub engines: Vec<String>,
+    /// Severity floor for this rule.
+    #[serde(default)]
+    pub min_severity: Option<String>,
+    /// Actions to take, in the order given.
+    #[serde(default)]
+    pub actions: Vec<String>,
+    /// Report but do not perform. Can only make a rule stricter: it cannot
+    /// switch prevention on when `prevention_enabled` is false.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Process metadata cache configuration
@@ -376,6 +584,27 @@ pub struct ResponseConfig {
 pub struct ProcessConfig {
     /// Maximum number of process metadata entries retained
     pub max_entries: usize,
+
+    /// Hash the executable behind process-start and image-load events.
+    ///
+    /// Fills the `Hashes` field the public Sigma corpus matches on. Without
+    /// it those rules load, see every event, and never match, which is the
+    /// worst failure mode a rule has.
+    ///
+    /// The cost is paid on the enrichment thread, between the sensor channel
+    /// and the detection engine, because a hash that arrives after the engine
+    /// has judged the event is a hash no rule can use. Repeats are free: the
+    /// cache is keyed by file identity, and a machine runs the same few
+    /// binaries over and over.
+    pub hash_images: bool,
+
+    /// Largest image that will be hashed, in MiB.
+    ///
+    /// The bound is what keeps a single enormous binary from stalling the
+    /// enrichment thread and shedding telemetry behind it. An image over the
+    /// limit is left without hashes rather than delaying everything queued
+    /// behind it.
+    pub hash_max_file_size_mb: u64,
 }
 
 /// Atomic IOC detection configuration
@@ -531,8 +760,32 @@ impl AppConfig {
             .set_default("response.channel_capacity", 128)?
             .set_default("response.allowlist_images", Vec::<String>::new())?
             .set_default("response.allowlist_paths", Vec::<String>::new())?
+            .set_default("response.protected_images", Vec::<String>::new())?
+            .set_default("response.max_actions_per_minute", 30i64)?
+            .set_default("response.cooldown_secs", 60i64)?
+            .set_default("response.audit_to_alerts", true)?
+            .set_default("response.quarantine_directory", "quarantine")?
+            // Per-action switches. Termination stays on because it is the
+            // behaviour that predates policy rules; the rest are opt-in.
+            .set_default("response.actions.terminate_process.enabled", true)?
+            .set_default("response.actions.suspend_process.enabled", false)?
+            .set_default("response.actions.isolate_host.enabled", false)?
+            .set_default("response.actions.isolate_host.persistent", true)?
+            .set_default(
+                "response.actions.isolate_host.allow_cidrs",
+                Vec::<String>::new(),
+            )?
+            .set_default("response.actions.isolate_host.allow_dns", true)?
+            .set_default("response.actions.isolate_host.allow_dhcp", true)?
+            .set_default("response.actions.block_process_network.enabled", false)?
+            .set_default("response.actions.quarantine_file.enabled", false)?
+            .set_default("response.actions.revert_registry.enabled", false)?
+            .set_default("response.actions.disable_service.enabled", false)?
+            .set_default("response.actions.disable_scheduled_task.enabled", false)?
             // Process cache
             .set_default("process.max_entries", 65536i64)?
+            .set_default("process.hash_images", true)?
+            .set_default("process.hash_max_file_size_mb", 64i64)?
             // IOC
             .set_default("ioc.enabled", true)?
             .set_default("ioc.hashes_path", "rules/current/ioc/hashes.txt")?
@@ -597,6 +850,12 @@ impl AppConfig {
             &mut self.logging.directory,
             base_dir,
             "LOGGING__DIRECTORY",
+            environment,
+        );
+        resolve_path_from_config(
+            &mut self.response.quarantine_directory,
+            base_dir,
+            "RESPONSE__QUARANTINE_DIRECTORY",
             environment,
         );
         resolve_path_from_config(
@@ -769,16 +1028,11 @@ impl Default for AppConfig {
             allowlist: AllowlistConfig {
                 paths: default_allowlist_paths(),
             },
-            response: ResponseConfig {
-                enabled: false,
-                prevention_enabled: false,
-                min_severity: "critical".to_string(),
-                channel_capacity: 128,
-                allowlist_images: Vec::new(),
-                allowlist_paths: Vec::new(),
-            },
+            response: ResponseConfig::default(),
             process: ProcessConfig {
                 max_entries: 65_536,
+                hash_images: true,
+                hash_max_file_size_mb: 64,
             },
             ioc: IocConfig {
                 enabled: true,

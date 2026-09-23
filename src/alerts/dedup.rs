@@ -379,6 +379,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-06-09T00:00:00Z".to_string(),
                 source_seq: None,
@@ -390,6 +391,10 @@ mod tests {
                 event_id_string: "1".to_string(),
                 opcode: 1,
                 fields: EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(image.to_string()),
                     image_source: None,
                     image_truncated: None,

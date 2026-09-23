@@ -33,7 +33,6 @@ pub(crate) fn enrich_event(event: &mut SensorEvent) {
         _ => {}
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::time::UNIX_EPOCH;
@@ -63,6 +62,10 @@ mod tests {
 
     fn process_fields(image: &str) -> ProcessCreationFields {
         ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(image.to_string()),
             image_source: None,
             image_truncated: None,
@@ -86,6 +89,8 @@ mod tests {
 
     fn image_load_fields(image: &str) -> ImageLoadFields {
         ImageLoadFields {
+            hashes: None,
+            signature_status: None,
             image_loaded: Some(image.to_string()),
             process_id: Some("42".to_string()),
             image: None,

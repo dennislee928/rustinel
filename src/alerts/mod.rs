@@ -7,8 +7,10 @@
 
 pub mod dedup;
 
-use crate::models::ecs::EcsAlert;
+use crate::models::ecs::{EcsAlert, EcsResponse};
 use crate::models::Alert;
+use crate::response::audit::ResponseAuditRecord;
+use crate::sensor::Platform;
 use std::io::Write;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -69,6 +71,27 @@ impl AlertSink {
             }
             Err(err) => {
                 error!(error = %err, "Failed to serialize ECS alert");
+            }
+        }
+    }
+
+    /// Write a response audit record.
+    ///
+    /// Bypasses dedup deliberately: two identical kills of two identical
+    /// processes are two separate things that happened to the machine, and
+    /// collapsing them would leave the record unable to answer what was done.
+    pub fn write_response(&self, record: &ResponseAuditRecord) {
+        let ecs = EcsResponse::from_record(record, Platform::current());
+
+        match serde_json::to_string(&ecs) {
+            Ok(line) => {
+                let mut writer = self.writer.clone();
+                if let Err(err) = writeln!(writer, "{}", line) {
+                    error!(error = %err, "Failed to write response audit record");
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to serialize response audit record");
             }
         }
     }

@@ -73,6 +73,7 @@ fn build_yara_alert(
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: chrono::DateTime::<chrono::Utc>::from(test_time()).to_rfc3339(),
             source_seq: None,
@@ -84,6 +85,10 @@ fn build_yara_alert(
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(path.to_string()),
                 image_source: None,
                 image_truncated: None,

@@ -30,6 +30,12 @@
 //!   offset 24: argv                (u64  — user pointer to char *const[])
 //!   offset 32: envp                (u64)
 //!
+//! sys_enter_ptrace tracepoint format (x86_64, 64-bit ABI):
+//!   offset 16: request             (i64  — PTRACE_ATTACH, PTRACE_SEIZE, ...)
+//!   offset 24: pid                 (i64  — the process being attached to)
+//!   offset 32: addr                (u64)
+//!   offset 40: data                (u64)
+//!
 //! sys_enter_execveat tracepoint format (same structure):
 //!   offset 16: fd                  (i64)
 //!   offset 24: filename            (u64  — user pointer to path string)
@@ -48,7 +54,10 @@ use aya_ebpf::{
     EbpfContext,
 };
 
-use crate::events::{event_metadata, ProcessEvent, ARGV_CAPACITY, PROCESS_IMAGE_CAPACITY};
+use crate::events::{
+    event_metadata, ProcessEvent, PtraceEvent, ARGV_CAPACITY, PROCESS_EVENT_KIND_PTRACE,
+    PROCESS_IMAGE_CAPACITY,
+};
 use crate::telemetry::{record_map_full, record_ring_full, record_submitted, PROCESS_FAMILY};
 
 /// Ring buffer shared with the userspace loader for process events.
@@ -192,6 +201,66 @@ unsafe fn try_handle_exec(ctx: &TracePointContext) -> Result<u32, i64> {
     (*event).process_start_time = process_start_time;
 
     attach_pending_argv(event, old_pid);
+
+    entry.submit(0);
+    record_submitted(PROCESS_FAMILY);
+
+    Ok(0)
+}
+
+
+/// Tracepoint handler for `syscalls/sys_enter_ptrace`.
+///
+/// `ptrace` is the Linux primitive for reading or writing another process's
+/// memory, which is how both credential theft and injection begin. Captured at
+/// *entry* rather than exit: a rule wants to know the attempt was made, and an
+/// attach that is refused by Yama or by a hardened kernel is at least as
+/// interesting as one that succeeds.
+#[tracepoint]
+pub fn handle_ptrace(ctx: TracePointContext) -> u32 {
+    unsafe { try_handle_ptrace(&ctx) }.unwrap_or(1)
+}
+
+#[inline(always)]
+unsafe fn try_handle_ptrace(ctx: &TracePointContext) -> Result<u32, i64> {
+    let request = ctx.read_at::<i64>(16)? as u32;
+    let target_pid = ctx.read_at::<i64>(24)? as i32;
+
+    // A negative or zero pid addresses a process group or "any child" rather
+    // than one process, which is not a cross-process read of a named target.
+    if target_pid <= 0 {
+        return Ok(0);
+    }
+    let target_pid = target_pid as u32;
+
+    let source_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    // Tracing yourself is what a debugger's own child does on every launch,
+    // and what a crash handler does on every fault. Dropping it in the kernel
+    // keeps it off the ring entirely rather than filtering it later.
+    if source_pid == target_pid {
+        return Ok(0);
+    }
+
+    let uid = bpf_get_current_uid_gid() as u32;
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let (event_time_ns, source_seq) = event_metadata();
+
+    let Some(mut entry) = PROCESS_RING.reserve::<PtraceEvent>(0) else {
+        record_ring_full(PROCESS_FAMILY);
+        return Ok(0);
+    };
+    let event = entry.as_mut_ptr();
+
+    (*event).event_time_ns = event_time_ns;
+    (*event).source_seq = source_seq;
+    (*event).kind = PROCESS_EVENT_KIND_PTRACE;
+    (*event).source_pid = source_pid;
+    (*event).target_pid = target_pid;
+    (*event).request = request;
+    (*event).uid = uid;
+    (*event)._pad = 0;
+    (*event).comm = comm;
+    (*event).process_start_time = current_process_start_time(source_pid);
 
     entry.submit(0);
     record_submitted(PROCESS_FAMILY);

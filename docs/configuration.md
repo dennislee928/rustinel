@@ -452,13 +452,64 @@ and timer-based delivery. Override the settings with
 | Option | Default | Description |
 | --- | --- | --- |
 | `enabled` | `false` | Enable the response engine |
-| `prevention_enabled` | `false` | If `false`, actions are logged but not executed |
-| `min_severity` | `critical` | Minimum severity to act on |
+| `prevention_enabled` | `false` | If `false`, actions are selected and recorded but not performed |
+| `min_severity` | `critical` | Severity floor, used only when no `[[response.rules]]` are defined |
 | `channel_capacity` | `128` | Queue size for response work |
 | `allowlist_images` | `[]` | Image basenames or full paths to skip |
 | `allowlist_paths` | inherits `allowlist.paths` | Module-specific trusted prefixes |
+| `protected_images` | `[]` | Never-act images, added to the compiled-in list |
+| `max_actions_per_minute` | `30` | Ceiling per action kind; `0` disables the ceiling |
+| `cooldown_secs` | `60` | Minimum gap between identical actions on one target |
+| `audit_to_alerts` | `true` | Write every attempted action to the alert stream |
+| `quarantine_directory` | `quarantine` | Where quarantined files are kept; relative paths resolve next to the config file |
 
-See [Active Response](active-response.md) for platform behavior and safe testing.
+#### Per-action switches
+
+Each action has a `[response.actions.<action>]` table with one `enabled` key. An
+action runs only when it is enabled here *and* selected by a policy rule *and*
+supported by the executor.
+
+| Action | Default | Status |
+| --- | --- | --- |
+| `terminate_process` | `true` | Implemented |
+| `suspend_process` | `false` | Implemented |
+| `isolate_host` | `false` | Windows only; enforced inline by the kernel |
+| `block_process_network` | `false` | Windows only; enforced inline by the kernel |
+| `quarantine_file` | `false` | All platforms |
+| `revert_registry` | `false` | Windows only |
+| `disable_service` | `false` | Windows only |
+| `disable_scheduled_task` | `false` | Windows only |
+
+`isolate_host` takes more than a switch, because it can strand a machine:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Whether isolation may run at all |
+| `persistent` | `true` | Whether the filters survive a reboot; `true` fails closed |
+| `allow_cidrs` | `[]` | Addresses that stay reachable; isolation refuses to run while this and both flags below are empty |
+| `allow_dns` | `true` | Keep name resolution working |
+| `allow_dhcp` | `true` | Keep the DHCP lease renewable |
+
+#### Policy rules
+
+`[[response.rules]]` entries are evaluated in order and the first match wins.
+Every field that is set must match; an unset field matches everything. With no
+rules defined the engine falls back to `min_severity` with `terminate_process`.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `name` | positional | Label used in logs and audit records |
+| `rule_ids` | `[]` | Exact `rule.id` values (`sigma::<uuid>`) |
+| `rule_names` | `[]` | Detection rule titles; `*` wildcards allowed |
+| `tags` | `[]` | Sigma rule tags; `*` wildcards allowed |
+| `categories` | `[]` | Sigma logsource category of the triggering event |
+| `engines` | `[]` | `sigma`, `yara`, `ioc` |
+| `min_severity` | none | Severity floor for this rule |
+| `actions` | `[]` | Actions to take, in any order; the engine orders them |
+| `dry_run` | `false` | Report without acting; can only tighten |
+
+See [Active Response](active-response.md) for what user mode can and cannot do,
+the safety checks, and safe testing.
 
 ### Process cache
 

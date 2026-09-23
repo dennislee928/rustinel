@@ -37,6 +37,7 @@ fn build_yara_alert(pid: u32, image: &str) -> Alert {
         rule_description: None,
         rule_id: None,
         engine: DetectionEngine::Yara,
+        tags: Vec::new(),
         event: NormalizedEvent {
             timestamp: "2026-01-01T00:00:00Z".to_string(),
             source_seq: None,
@@ -48,6 +49,10 @@ fn build_yara_alert(pid: u32, image: &str) -> Alert {
             event_id_string: "1".to_string(),
             opcode: 1,
             fields: EventFields::ProcessCreation(ProcessCreationFields {
+                hashes: None,
+                signed: None,
+                signature: None,
+                signature_status: None,
                 image: Some(image.to_string()),
                 image_source: None,
                 image_truncated: None,
@@ -88,6 +93,7 @@ fn response_config(
         channel_capacity: 128,
         allowlist_images,
         allowlist_paths,
+        ..ResponseConfig::default()
     }
 }
 
@@ -122,6 +128,7 @@ fn response_dry_run_no_panic() {
         channel_capacity: 128,
         allowlist_images: vec![],
         allowlist_paths: vec![],
+        ..ResponseConfig::default()
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -151,6 +158,7 @@ fn response_engine_skips_below_min_severity() {
         channel_capacity: 128,
         allowlist_images: vec![],
         allowlist_paths: vec![],
+        ..ResponseConfig::default()
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -283,7 +291,7 @@ fn response_decision_respects_allowlists_and_mode() {
             response_config(true, true, "critical", vec![], vec![]),
             &alert
         ),
-        ResponseDecision::Terminate { pid: 4242, .. }
+        ResponseDecision::Execute { pid: 4242, .. }
     ));
 }
 
@@ -296,7 +304,7 @@ fn response_decision_uses_detector_pipeline_severity_rules() {
             response_config(true, true, "critical", vec![], vec![]),
             &yara
         ),
-        ResponseDecision::Terminate { pid: 4242, .. }
+        ResponseDecision::Execute { pid: 4242, .. }
     ));
 
     let mut sigma = yara.clone();
@@ -304,7 +312,7 @@ fn response_decision_uses_detector_pipeline_severity_rules() {
     sigma.severity = AlertSeverity::High;
     assert!(matches!(
         decision_for(response_config(true, true, "high", vec![], vec![]), &sigma),
-        ResponseDecision::Terminate { pid: 4242, .. }
+        ResponseDecision::Execute { pid: 4242, .. }
     ));
     assert!(matches!(
         decision_for(
@@ -349,6 +357,7 @@ fn response_dry_run_does_not_kill_child() {
         channel_capacity: 128,
         allowlist_images: vec![],
         allowlist_paths: vec![],
+        ..ResponseConfig::default()
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -401,6 +410,7 @@ fn response_reaction_terminates_child_process() {
         channel_capacity: 128,
         allowlist_images: vec![],
         allowlist_paths: vec![],
+        ..ResponseConfig::default()
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

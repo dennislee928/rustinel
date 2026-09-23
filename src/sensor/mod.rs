@@ -10,10 +10,39 @@ pub(crate) mod dns;
 mod integrity_level;
 #[cfg(target_os = "linux")]
 pub mod linux;
+// The eBPF wire format compiled for tests on every platform, not just Linux.
+//
+// `linux/events.rs` gates only its conversion half; the structs and the layout
+// assertions beside them are plain data and were written to build anywhere.
+// They could not, because `linux` as a whole needs aya and the compiled eBPF
+// object, so the assertions that guard a kernel-to-userspace ABI only ever ran
+// on one runner — which is the runner that would already have shipped the
+// mismatch. This alias builds those assertions here too.
+//
+// Dead-code is allowed because only the data half is built here: the consumers
+// of these constants live in the conversion module, which stays Linux-gated.
+#[cfg(all(not(target_os = "linux"), test))]
+#[path = "linux/events.rs"]
+#[allow(dead_code)]
+pub(crate) mod linux_events;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(any(windows, test))]
 mod network_events;
+// Same reason as `persistence` below: plain data assembly, so it is built and
+// tested on every platform rather than only on a macOS runner. Linux is in the
+// list because the eBPF sensor calls it too -- src/sensor/linux/ebpf.rs turns a
+// ptrace attach into a ProcessAccess event through this module.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) mod cross_process;
+/// Post-sensor enrichment, on every platform that has a sensor.
+pub(crate) mod enrichment;
+// Compiled for tests everywhere, like `integrity_level`: the logic is pure
+// path handling, and a classifier only exercised on a macOS runner is one
+// whose evasion cases nobody runs. Linux needs it at runtime as well --
+// src/sensor/linux/events.rs classifies every file write through it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) mod persistence;
 #[cfg(windows)]
 pub mod windows;
 
@@ -25,9 +54,9 @@ use tokio::sync::mpsc::Sender;
 
 use crate::models::{
     DnsQueryFields, EventCategory, EventFields, FileEventFields, ImageLoadFields,
-    NetworkConnectionFields, PowerShellModuleFields, PowerShellScriptFields, ProcessCreationFields,
-    RegistryEventFields, SecurityAuditFields, ServiceCreationFields, TaskCreationFields,
-    WmiEventFields,
+    NetworkConnectionFields, PowerShellModuleFields, PowerShellScriptFields, ProcessAccessFields,
+    ProcessCreationFields, RegistryEventFields, RemoteThreadFields, SecurityAuditFields,
+    ServiceCreationFields, TaskCreationFields, WmiEventFields,
 };
 
 /// Cross-platform sensor interface.
@@ -54,6 +83,29 @@ pub enum Platform {
 }
 
 impl Platform {
+    /// The platform this agent is running on.
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Windows
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            Self::Linux
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOS
+        }
+
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        {
+            Self::Windows
+        }
+    }
+
     /// The lowercase platform name, matching how it is serialized.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -245,6 +297,8 @@ pub enum SensorPayload {
     Dns(DnsQueryFields),
     Registry(RegistryEventFields),
     ImageLoad(ImageLoadFields),
+    RemoteThread(RemoteThreadFields),
+    ProcessAccess(ProcessAccessFields),
     Scripting(PowerShellScriptFields),
     PowerShellModule(PowerShellModuleFields),
     Wmi(WmiEventFields),
@@ -263,6 +317,8 @@ impl SensorPayload {
             Self::Dns(_) => EventCategory::Dns,
             Self::Registry(_) => EventCategory::Registry,
             Self::ImageLoad(_) => EventCategory::ImageLoad,
+            Self::RemoteThread(_) => EventCategory::RemoteThread,
+            Self::ProcessAccess(_) => EventCategory::ProcessAccess,
             Self::Scripting(_) => EventCategory::Scripting,
             Self::PowerShellModule(_) => EventCategory::PowerShellModule,
             Self::Wmi(_) => EventCategory::Wmi,
@@ -282,6 +338,8 @@ impl SensorPayload {
             Self::Dns(fields) => EventFields::DnsQuery(fields),
             Self::Registry(fields) => EventFields::RegistryEvent(fields),
             Self::ImageLoad(fields) => EventFields::ImageLoad(fields),
+            Self::RemoteThread(fields) => EventFields::RemoteThread(fields),
+            Self::ProcessAccess(fields) => EventFields::ProcessAccess(fields),
             Self::Scripting(fields) => EventFields::PowerShellScript(fields),
             Self::PowerShellModule(fields) => EventFields::PowerShellModule(fields),
             Self::Wmi(fields) => EventFields::WmiEvent(fields),
@@ -303,6 +361,8 @@ impl TryFrom<EventFields> for SensorPayload {
             EventFields::DnsQuery(fields) => Ok(Self::Dns(fields)),
             EventFields::RegistryEvent(fields) => Ok(Self::Registry(fields)),
             EventFields::ImageLoad(fields) => Ok(Self::ImageLoad(fields)),
+            EventFields::RemoteThread(fields) => Ok(Self::RemoteThread(fields)),
+            EventFields::ProcessAccess(fields) => Ok(Self::ProcessAccess(fields)),
             EventFields::PowerShellScript(fields) => Ok(Self::Scripting(fields)),
             EventFields::PowerShellModule(fields) => Ok(Self::PowerShellModule(fields)),
             EventFields::WmiEvent(fields) => Ok(Self::Wmi(fields)),
@@ -324,6 +384,10 @@ mod tests {
     #[test]
     fn payload_category_matches_variant() {
         let payload = SensorPayload::Process(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some("/usr/bin/bash".to_string()),
             image_source: None,
             image_truncated: None,
@@ -386,6 +450,7 @@ mod tests {
     #[test]
     fn payload_round_trips_through_event_fields() {
         let payload = SensorPayload::File(FileEventFields {
+            persistence_mechanism: None,
             source_filename: None,
             target_filename: Some("/tmp/example".to_string()),
             process_id: Some("77".to_string()),

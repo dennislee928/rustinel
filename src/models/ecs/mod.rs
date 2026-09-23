@@ -9,9 +9,11 @@ mod event;
 mod helpers;
 mod network;
 mod registry;
+mod response;
 mod user;
 
 pub use alert::{DnsAnswer, EcsAlert, ReplayProvenance};
+pub use response::EcsResponse;
 
 use crate::models::{Alert, EventFields};
 use event::{
@@ -19,7 +21,9 @@ use event::{
     ecs_object_access_category, event_dataset, event_provider, host_os_family, host_os_type,
     network_direction_from_category, network_direction_from_initiated,
 };
-use helpers::{basename, file_extension_from_path, parse_bool, parse_u16, parse_u64};
+use helpers::{
+    basename, file_extension_from_path, parse_bool, parse_u16, parse_u64, split_sysmon_hashes,
+};
 use network::{extract_ips, network_transport_from_opcode, network_type_from_ip};
 use registry::split_registry_path;
 use user::apply_user_fields;
@@ -61,6 +65,7 @@ impl From<&Alert> for EcsAlert {
             rule_name: alert.rule_name.clone(),
             rule_description: alert.rule_description.clone(),
             rule_id: alert.rule_id.clone(),
+            rule_tags: alert.tags.clone(),
             edr_rule_severity: format!("{:?}", alert.severity),
             edr_rule_engine: format!("{:?}", alert.engine),
             process_executable: None,
@@ -75,6 +80,12 @@ impl From<&Alert> for EcsAlert {
             process_parent_pid: None,
             process_working_directory: None,
             edr_process_integrity_level: None,
+            process_hash_md5: None,
+            process_hash_sha256: None,
+            process_code_signature_exists: None,
+            process_code_signature_valid: None,
+            process_code_signature_subject_name: None,
+            process_code_signature_status: None,
             process_original_file_name: None,
             process_product: None,
             process_description: None,
@@ -142,6 +153,10 @@ impl From<&Alert> for EcsAlert {
             edr_remote_thread_start_address: None,
             edr_remote_thread_start_module: None,
             edr_remote_thread_start_function: None,
+            edr_process_access_target_pid: None,
+            edr_process_access_target_image: None,
+            edr_process_access_granted_access: None,
+            edr_process_access_target_thread_id: None,
             edr_process_target_image: None,
             edr_security: None,
             related_ip: None,
@@ -168,6 +183,18 @@ impl From<&Alert> for EcsAlert {
                 ecs.process_description = f.description.clone();
                 ecs.process_company = f.company.clone();
                 ecs.process_file_version = f.file_version.clone();
+                (ecs.process_hash_md5, ecs.process_hash_sha256) =
+                    split_sysmon_hashes(f.hashes.as_deref());
+                // `Signed` is Sysmon's "true"/"false" string. Absent stays
+                // absent: "not checked" is not "unsigned".
+                ecs.process_code_signature_valid = parse_bool(&f.signed);
+                ecs.process_code_signature_exists = ecs.process_code_signature_valid.map(|valid| {
+                    // A status of Unsigned means nothing was there to verify;
+                    // anything else means a signature existed and was judged.
+                    valid || f.signature_status.as_deref() != Some("Unsigned")
+                });
+                ecs.process_code_signature_subject_name = f.signature.clone();
+                ecs.process_code_signature_status = f.signature_status.clone();
                 apply_user_fields(&mut ecs, f.user.as_deref());
                 ecs.edr_process_target_image = f.target_image.clone();
             }
@@ -304,6 +331,17 @@ impl From<&Alert> for EcsAlert {
                 ecs.edr_remote_thread_start_function = f.start_function.clone();
                 apply_user_fields(&mut ecs, f.user.as_deref());
             }
+            EventFields::ProcessAccess(f) => {
+                // The caller is the subject of the event: it is the process
+                // that asked for the handle, and the one response acts on.
+                ecs.process_executable = f.source_image.clone();
+                ecs.process_pid = parse_u64(&f.source_process_id);
+                ecs.edr_process_access_target_pid = parse_u64(&f.target_process_id);
+                ecs.edr_process_access_target_image = f.target_image.clone();
+                ecs.edr_process_access_granted_access = f.granted_access.clone();
+                ecs.edr_process_access_target_thread_id = parse_u64(&f.target_thread_id);
+                apply_user_fields(&mut ecs, f.user.as_deref());
+            }
             EventFields::SecurityAudit(f) => {
                 // Windows names the acting identity in three separate fields;
                 // the rest of the model carries one `DOMAIN\\user` string, so
@@ -431,6 +469,7 @@ mod tests {
             rule_description: None,
             rule_id: Some("sigma::test-rule-id".to_string()),
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -442,6 +481,10 @@ mod tests {
                 event_id_string: "1".to_string(),
                 opcode: 1,
                 fields: EventFields::ProcessCreation(ProcessCreationFields {
+                    hashes: None,
+                    signed: None,
+                    signature: None,
+                    signature_status: None,
                     image: Some(r"C:\Windows\System32\cmd.exe".to_string()),
                     image_source: None,
                     image_truncated: None,
@@ -510,6 +553,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: Some(81234),
@@ -570,6 +614,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -639,6 +684,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -682,6 +728,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -774,6 +821,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -823,6 +871,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-01-06T00:00:00Z".to_string(),
                 source_seq: None,
@@ -834,6 +883,7 @@ mod tests {
                 event_id_string: "11".to_string(),
                 opcode: 64,
                 fields: EventFields::FileEvent(FileEventFields {
+                    persistence_mechanism: None,
                     source_filename: None,
                     target_filename: Some(r"C:\Users\alice\evil.ps1".to_string()),
                     process_id: Some("777".to_string()),
@@ -864,6 +914,7 @@ mod tests {
             rule_description: None,
             rule_id: None,
             engine: DetectionEngine::Sigma,
+            tags: Vec::new(),
             event: NormalizedEvent {
                 timestamp: "2026-02-04T00:00:00Z".to_string(),
                 source_seq: None,

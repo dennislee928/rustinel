@@ -26,9 +26,13 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, Result};
 use endpoint_sec::{
     Client, Event, EventClose, EventCreate, EventCreateDestinationFile, EventExec, EventRename,
-    EventRenameDestinationFile, EventUnlink, Message,
+    EventRenameDestinationFile, EventUnlink, Message, Process,
 };
 use endpoint_sec_sys::{es_event_type_t, NewClientError};
+
+use crate::sensor::cross_process::{
+    is_cross_process, process_access_event, remote_thread_event, AccessMethod, RawCrossProcess,
+};
 use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
@@ -54,6 +58,15 @@ const SUBSCRIPTIONS: &[es_event_type_t] = &[
     es_event_type_t::ES_EVENT_TYPE_NOTIFY_UNLINK,
     es_event_type_t::ES_EVENT_TYPE_NOTIFY_RENAME,
     es_event_type_t::ES_EVENT_TYPE_NOTIFY_CLOSE,
+    // One process reaching into another: the shape of both credential theft
+    // and code injection, and the largest thing the macOS sensor could not
+    // see. `task_for_pid` is the macOS equivalent of opening a handle to
+    // `lsass`; `ptrace` is a separate primitive with its own restrictions;
+    // a remote thread is injection that has already succeeded.
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_TRACE,
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_GET_TASK,
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_GET_TASK_READ,
+    es_event_type_t::ES_EVENT_TYPE_NOTIFY_REMOTE_THREAD_CREATE,
 ];
 
 /// macOS Endpoint Security sensor. Implements [`Sensor`].
@@ -229,8 +242,61 @@ fn build_sensor_event(msg: &Message) -> Option<SensorEvent> {
         Event::NotifyUnlink(unlink) => build_unlink_event(msg, &unlink),
         Event::NotifyRename(rename) => build_rename_event(msg, &rename),
         Event::NotifyClose(close) => build_close_event(msg, &close),
+        Event::NotifyTrace(trace) => {
+            build_cross_process(msg, &trace.target(), Some(AccessMethod::Ptrace))
+        }
+        Event::NotifyGetTask(task) => {
+            build_cross_process(msg, &task.target(), Some(AccessMethod::TaskForPid))
+        }
+        Event::NotifyGetTaskRead(task) => {
+            build_cross_process(msg, &task.target(), Some(AccessMethod::TaskRead))
+        }
+        Event::NotifyRemoteThreadCreate(remote) => build_cross_process(msg, &remote.target(), None),
         _ => None,
     }
+}
+
+/// Assemble a cross-process event from the acting process and its target.
+///
+/// `method` distinguishes the process-access primitives; `None` means this was
+/// a remote thread creation, which is a different event class rather than
+/// another way of obtaining access.
+///
+/// Self-access is dropped here rather than in the classifier: a process
+/// inspecting or remapping itself is ordinary, and it is the overwhelming
+/// majority of these events.
+fn build_cross_process(
+    msg: &Message,
+    target: &Process<'_>,
+    method: Option<AccessMethod>,
+) -> Option<SensorEvent> {
+    let (source_pid, source_image, user, process_start_key) = actor(msg);
+    let target_pid = target.audit_token().pid() as u32;
+
+    if !is_cross_process(source_pid, target_pid) {
+        return None;
+    }
+
+    let raw = RawCrossProcess {
+        platform: Platform::MacOS,
+        provider: "esf",
+        source_pid,
+        source_image,
+        target_pid,
+        target_image: {
+            let path = osstr_to_string(target.executable().path());
+            (!path.is_empty()).then_some(path)
+        },
+        user: Some(user),
+        event_time: msg.time(),
+        source_seq: msg.global_seq_num(),
+        process_start_key,
+    };
+
+    Some(match method {
+        Some(method) => process_access_event(raw, method),
+        None => remote_thread_event(raw),
+    })
 }
 
 /// Plain, FFI-free description of an exec, extracted from an ESF event.
@@ -249,6 +315,15 @@ struct RawExec {
     start_time: u64,
     event_time: SystemTime,
     source_seq: Option<u64>,
+    /// Code Directory hash, hex, as Sysmon would spell a hash field.
+    cdhash: Option<String>,
+    /// Signing identity: the team identifier, or the signing identifier when
+    /// there is no team.
+    signing_identity: Option<String>,
+    /// Whether the kernel accepted the signature.
+    signed: bool,
+    /// Why, in Sysmon's vocabulary.
+    signature_status: &'static str,
 }
 
 /// Extract the fields we care about from an ESF exec event.
@@ -293,7 +368,74 @@ fn build_exec_event(msg: &Message, exec: &EventExec) -> Option<SensorEvent> {
         start_time,
         event_time,
         source_seq: msg.global_seq_num(),
+        cdhash: cdhash_hex(&target.cdhash()),
+        signing_identity: signing_identity(&target),
+        signed: is_signed(&target),
+        signature_status: signature_status(&target),
     }))
+}
+
+/// `CS_VALID`: the kernel has verified this binary's signature.
+///
+/// Taken from `cs_blobs.h`. The flag is the kernel's own live verdict, which
+/// is why nothing here opens the file: on macOS the answer Authenticode needs
+/// a full verification pass for is already attached to the event.
+const CS_VALID: u32 = 0x0000_0001;
+/// `CS_SIGNED`: a signature is present, whether or not it validated.
+const CS_SIGNED: u32 = 0x2000_0000;
+
+/// The Code Directory hash as lowercase hex.
+///
+/// All-zero means the kernel recorded no hash, which is not the same as a hash
+/// of zero, so it is reported as absent.
+fn cdhash_hex(cdhash: &[u8; 20]) -> Option<String> {
+    if cdhash.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    let mut hex = String::with_capacity(40);
+    for byte in cdhash {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
+}
+
+/// Team identifier, falling back to the signing identifier.
+///
+/// The team id is the stable identity of whoever signed it; an unsigned or
+/// ad-hoc binary has neither, and reports nothing.
+fn signing_identity(process: &Process<'_>) -> Option<String> {
+    let team = osstr_to_string(process.team_id());
+    if !team.is_empty() {
+        return Some(team);
+    }
+    let signing = osstr_to_string(process.signing_id());
+    (!signing.is_empty()).then_some(signing)
+}
+
+/// Whether the kernel accepted the signature.
+fn is_signed(process: &Process<'_>) -> bool {
+    process.codesigning_flags() & CS_VALID != 0
+}
+
+/// Why the signature was or was not accepted, in Sysmon's vocabulary.
+///
+/// `Platform` is a macOS notion with no Sysmon equivalent and is worth keeping:
+/// a binary shipped by Apple is a materially different thing from one merely
+/// signed by a valid certificate.
+fn signature_status(process: &Process<'_>) -> &'static str {
+    let flags = process.codesigning_flags();
+    if flags & CS_VALID != 0 {
+        if process.is_platform_binary() {
+            "Platform"
+        } else {
+            "Valid"
+        }
+    } else if flags & CS_SIGNED != 0 {
+        "Invalid"
+    } else {
+        "Unsigned"
+    }
 }
 
 /// Assemble a process-start [`SensorEvent`] from FFI-free exec fields.
@@ -317,6 +459,10 @@ fn process_start_event(raw: RawExec) -> SensorEvent {
         }),
         parent_process_start_key: None,
         payload: SensorPayload::Process(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: Some(raw.image),
             image_source: None,
             image_truncated: None,
@@ -337,6 +483,16 @@ fn process_start_event(raw: RawExec) -> SensorEvent {
             // Windows-specific; absent on macOS.
             integrity_level: None,
             user: Some(raw.user),
+            // Sysmon's spelling, so a rule matching `Hashes|contains:` reads
+            // it the same way it reads a Windows event. CDHASH rather than
+            // MD5 or SHA256: it is what the kernel actually computed, and
+            // hashing the file again here would cost a full read per exec.
+            hashes: raw
+                .cdhash
+                .map(|hash| format!("CDHASH={}", hash.to_uppercase())),
+            signed: Some(raw.signed.to_string()),
+            signature: raw.signing_identity,
+            signature_status: Some(raw.signature_status.to_string()),
         }),
     }
 }
@@ -379,6 +535,10 @@ fn process_stop_event(
         process_start_key: start_time.map(|start_time| ProcessStartKey { pid, start_time }),
         parent_process_start_key: None,
         payload: SensorPayload::Process(ProcessCreationFields {
+            hashes: None,
+            signed: None,
+            signature: None,
+            signature_status: None,
             image: None,
             image_source: None,
             image_truncated: None,
@@ -567,6 +727,13 @@ fn file_event(raw: RawFile) -> Option<SensorEvent> {
     }
     let (action, event_id, action_code) = raw.action.normalization();
 
+    // Classified from the destination, not the source: a rename *into*
+    // `LaunchAgents` is how persistence is usually installed, because staging
+    // the plist elsewhere and moving it in is both atomic and quieter than
+    // writing it in place.
+    let persistence = crate::sensor::persistence::classify_for(Platform::MacOS, &raw.target)
+        .map(|mechanism| mechanism.as_str().to_string());
+
     Some(SensorEvent {
         platform: Platform::MacOS,
         provider: "esf",
@@ -581,6 +748,7 @@ fn file_event(raw: RawFile) -> Option<SensorEvent> {
         process_start_key: raw.process_start_key,
         parent_process_start_key: None,
         payload: SensorPayload::File(FileEventFields {
+            persistence_mechanism: persistence,
             source_filename: raw.source,
             target_filename: Some(raw.target),
             process_id: Some(raw.pid.to_string()),
@@ -654,6 +822,10 @@ mod tests {
             start_time: 1_700_000_000_000_000_000,
             event_time: SystemTime::UNIX_EPOCH,
             source_seq: Some(77),
+            cdhash: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            signing_identity: Some("ABCDE12345".to_string()),
+            signed: true,
+            signature_status: "Valid",
         });
 
         assert_eq!(event.platform, Platform::MacOS);
@@ -682,9 +854,47 @@ mod tests {
                 assert_eq!(fields.current_directory.as_deref(), Some("/Users/alice"));
                 assert_eq!(fields.user.as_deref(), Some("alice"));
                 assert_eq!(fields.parent_image.as_deref(), Some("/bin/zsh"));
+
+                // Read off the event rather than the file: Endpoint Security
+                // carries the kernel's own verdict, so a macOS process start
+                // has an identity and a signer without any I/O at all.
+                assert_eq!(
+                    fields.hashes.as_deref(),
+                    Some("CDHASH=0123456789ABCDEF0123456789ABCDEF01234567")
+                );
+                assert_eq!(fields.signed.as_deref(), Some("true"));
+                assert_eq!(fields.signature.as_deref(), Some("ABCDE12345"));
+                assert_eq!(fields.signature_status.as_deref(), Some("Valid"));
             }
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    /// An all-zero Code Directory hash means the kernel recorded none.
+    ///
+    /// Reporting it as forty zeroes would give every unsigned binary the same
+    /// identity, and any rule matching on it would match all of them at once.
+    #[test]
+    fn an_absent_cdhash_is_not_a_hash_of_zero() {
+        assert!(cdhash_hex(&[0u8; 20]).is_none());
+
+        let mut cdhash = [0u8; 20];
+        cdhash[19] = 0xAB;
+        assert_eq!(
+            cdhash_hex(&cdhash).as_deref(),
+            Some("00000000000000000000000000000000000000ab")
+        );
+    }
+
+    /// The flags are read as a bitmask, not compared for equality.
+    ///
+    /// A real `codesigning_flags` carries a dozen other bits; testing for
+    /// equality against `CS_VALID` would call every signed binary unsigned.
+    #[test]
+    fn the_codesigning_flags_are_read_as_a_mask() {
+        const CS_HARD: u32 = 0x0000_0100;
+        assert_ne!(CS_VALID & (CS_VALID | CS_HARD | CS_SIGNED), 0);
+        assert_eq!(CS_VALID & CS_HARD, 0);
     }
 
     fn raw_file(action: FileAction, target: &str, source: Option<&str>) -> RawFile {
@@ -705,6 +915,63 @@ mod tests {
     }
 
     #[test]
+    /// A plist landing in a LaunchAgents folder is named as persistence.
+    ///
+    /// This is what the classifier exists for: without it every rule about
+    /// macOS persistence has to carry the path list itself.
+    #[test]
+    fn a_write_into_launchagents_is_marked_as_persistence() {
+        let event = file_event(raw_file(
+            FileAction::Create,
+            "/Users/alice/Library/LaunchAgents/com.evil.plist",
+            None,
+        ))
+        .expect("create event should build");
+
+        match event.payload {
+            SensorPayload::File(fields) => {
+                assert_eq!(
+                    fields.persistence_mechanism.as_deref(),
+                    Some("launch_agent")
+                );
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    /// Staging elsewhere and renaming in is the usual install, so the
+    /// destination is what gets classified.
+    #[test]
+    fn a_rename_into_a_persistence_location_is_classified_by_its_destination() {
+        let event = file_event(raw_file(
+            FileAction::Rename,
+            "/Library/LaunchDaemons/com.evil.plist",
+            Some("/tmp/staged.plist"),
+        ))
+        .expect("rename event should build");
+
+        match event.payload {
+            SensorPayload::File(fields) => {
+                assert_eq!(
+                    fields.persistence_mechanism.as_deref(),
+                    Some("launch_daemon")
+                );
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_write_carries_no_persistence_marker() {
+        let event = file_event(raw_file(FileAction::Create, "/tmp/new.txt", None))
+            .expect("create event should build");
+
+        match event.payload {
+            SensorPayload::File(fields) => assert!(fields.persistence_mechanism.is_none()),
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
     fn file_event_maps_create() {
         let event = file_event(raw_file(FileAction::Create, "/tmp/new.txt", None))
             .expect("create event should build");
@@ -826,6 +1093,10 @@ mod tests {
             start_time: 0,
             event_time: SystemTime::UNIX_EPOCH,
             source_seq: None,
+            cdhash: None,
+            signing_identity: None,
+            signed: false,
+            signature_status: "Unsigned",
         });
 
         match event.payload {

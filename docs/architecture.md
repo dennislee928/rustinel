@@ -275,9 +275,37 @@ On Windows, the agent also snapshots running processes during startup so `Proces
 ### Active Response
 
 - Optional and disabled by default
-- Alerts above the configured threshold are queued to a background worker
-- Windows uses process termination APIs
-- Linux and macOS use `SIGKILL`
+- Alerts selected by policy are queued to a background worker
+- The engine decides *whether* to act; an executor decides *how*
+
+The separation matters because Rustinel runs in user mode. An executor declares,
+per action, whether it can act at all and whether acting denies the operation or
+cleans up after it. `Ring3Executor` does the work today and every action it
+performs is `post_hoc`: the kernel completed the operation before the sensor saw
+it. `KernelDriverExecutor` is the seam a signed driver would fill, and reports
+every action unsupported until one exists.
+
+| Action | Windows layer | User mode today | With a kernel driver |
+| --- | --- | --- | --- |
+| `terminate_process` | Executive: process manager | `OpenProcess` + `TerminateProcess`; `SIGKILL` on Unix | `PsSetCreateProcessNotifyRoutineEx` denial |
+| `suspend_process` | Executive: process manager | `NtSuspendProcess`; `SIGSTOP` on Unix | `ObRegisterCallbacks` access stripping |
+| `isolate_host` | Drivers: WFP | WFP filters (not implemented) | WFP callout for packet inspection |
+| `quarantine_file` | Executive: I/O manager | Move plus ACL (not implemented) | Minifilter pre-create denial |
+| `revert_registry` | Executive: configuration manager | Delete or restore (not implemented) | `CmRegisterCallbackEx` denial |
+
+Selection, safety, and audit sit above that boundary and do not change with the
+executor:
+
+1. **Policy** (`response::policy`) matches an alert against `[[response.rules]]`
+   on rule id, name, tags, severity, logsource category, and engine. First match
+   wins; with no rules configured it synthesizes the pre-policy behaviour.
+2. **Safety** (`response::safety`) refuses protected, critical, and
+   protected-process-light targets, and applies a per-kind rate ceiling and a
+   per-target cooldown.
+3. **Identity revalidation** happens immediately before acting, so a recycled
+   PID is never acted on in place of the process that alerted.
+4. **Audit** (`response::audit`) records every attempt, including dry runs and
+   suppressions, into the alert stream as `event.dataset: rustinel.response`.
 
 ## Current Cross-Platform Scope
 

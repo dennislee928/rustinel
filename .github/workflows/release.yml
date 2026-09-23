@@ -95,10 +95,21 @@ jobs:
     name: Build Windows x86_64
     runs-on: windows-latest
     needs: ci
+    # Lifted to the job so the signing steps can ask whether credentials exist.
+    # A secret is not readable through `env.` in a step condition unless it is
+    # mapped here first, and without that every `if` below is silently false and
+    # the release ships unsigned.
+    env:
+      SM_API_KEY: ${{ secrets.SM_API_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
@@ -144,10 +155,101 @@ jobs:
             exit 1
           }
 
+      # DigiCert KeyLocker keeps the private key in an HSM, which is what a
+      # code-signing certificate issued after June 2023 requires: the
+      # CA/Browser Forum baseline requirements stopped allowing exportable
+      # keys, so there is no PFX to hand a runner.
+      #
+      # The whole block is skipped when the credentials are absent, so a fork
+      # still produces an installer. It is unsigned, and the release job below
+      # refuses to publish one.
+      - name: Stage the DigiCert client certificate
+        id: digicert-cert
+        if: ${{ env.SM_API_KEY != '' }}
+        shell: bash
+        env:
+          SM_CLIENT_CERT_FILE_B64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+        run: |
+          : "${SM_CLIENT_CERT_FILE_B64:?SM_CLIENT_CERT_FILE_B64 is required for signing}"
+          cert_path="$RUNNER_TEMP/digicert-client.p12"
+          echo "$SM_CLIENT_CERT_FILE_B64" | base64 --decode > "$cert_path"
+          # Windows-style path: the DigiCert tools are native Windows binaries.
+          echo "SM_CLIENT_CERT_FILE=$(cygpath -w "$cert_path")" >> "$GITHUB_ENV"
+          echo "SM_HOST=${{ secrets.SM_HOST }}" >> "$GITHUB_ENV"
+          echo "SM_API_KEY=${{ secrets.SM_API_KEY }}" >> "$GITHUB_ENV"
+          echo "SM_CLIENT_CERT_PASSWORD=${{ secrets.SM_CLIENT_CERT_PASSWORD }}" >> "$GITHUB_ENV"
+          echo "SM_CODE_SIGNING_CERT_SHA1_HASH=${{ secrets.SM_CODE_SIGNING_CERT_SHA1_HASH }}" >> "$GITHUB_ENV"
+          echo "SM_KEYPAIR_ALIAS=${{ secrets.SM_KEYPAIR_ALIAS }}" >> "$GITHUB_ENV"
+
+      - name: Install the DigiCert signing tools
+        if: ${{ env.SM_API_KEY != '' }}
+        uses: digicert/ssm-code-signing@1d820463733701cf1484c7eb5d7d24a15ca2c454 # v1.2.1
+
+      # Registers the signing certificate with the Windows certificate store
+      # and the DigiCert KSP, which is how signtool reaches a key it cannot
+      # hold.
+      - name: Register the signing certificate
+        if: ${{ env.SM_API_KEY != '' }}
+        shell: cmd
+        run: |
+          smctl healthcheck --all
+          smksp_registrar.exe list
+          smctl windows certsync --keypair-alias=%SM_KEYPAIR_ALIAS%
+
+      - name: Sign the agent binary
+        if: ${{ env.SM_API_KEY != '' }}
+        shell: pwsh
+        run: ./scripts/windows/sign.ps1 -Path target/release/rustinel.exe -Required
+
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+
+      # The binary is already signed, so the MSI wraps a signed executable and
+      # is itself signed here. Signing only the MSI would leave an unsigned
+      # agent on disk after installation, which is the file Windows judges on
+      # every launch.
+      - name: Build the installer
+        shell: pwsh
+        env:
+          SIGNING_AVAILABLE: ${{ env.SM_API_KEY != '' }}
+        run: |
+          if ($env:SIGNING_AVAILABLE -eq 'true') {
+            ./scripts/windows/build-msi.ps1 `
+              -Version "${{ steps.version.outputs.version }}" `
+              -Sign -RequireSigning
+          }
+          else {
+            Write-Warning 'No signing credentials; building an unsigned installer.'
+            ./scripts/windows/build-msi.ps1 -Version "${{ steps.version.outputs.version }}"
+          }
+
+      - name: Verify the installer
+        shell: pwsh
+        env:
+          SIGNING_AVAILABLE: ${{ env.SM_API_KEY != '' }}
+        run: |
+          $msi = (Get-Item dist/*.msi).FullName
+          if ($env:SIGNING_AVAILABLE -eq 'true') {
+            ./scripts/windows/verify-msi.ps1 -Path $msi -ExpectSigned
+          }
+          else {
+            ./scripts/windows/verify-msi.ps1 -Path $msi
+          }
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rustinel-windows-x86_64
           path: target/release/rustinel.exe
+          retention-days: 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rustinel-windows-installer
+          path: dist/*.msi
           retention-days: 1
 
   build-macos:
@@ -454,6 +556,12 @@ jobs:
           name: rustinel-windows-x86_64
           path: dist/windows-x86_64/
 
+      - name: Download Windows installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: rustinel-windows-installer
+          path: dist/windows-installer/
+
       - name: Download macOS arm64 package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -522,6 +630,70 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
 
+      - name: Stage Windows installer
+        run: cp dist/windows-installer/*.msi .
+
+      # The build job is allowed to produce unsigned Windows artifacts, because
+      # a fork has no access to the signing secrets and should still be able to
+      # cut a release of its own. This repository is not allowed to publish one.
+      #
+      # The gate is deliberately not conditioned on the secret being present.
+      # Every signing step in the build job is skipped when SM_API_KEY is
+      # absent, so a secret that was deleted, rotated, or left to expire turns
+      # a signed release into an unsigned one with no failure anywhere. That is
+      # the case this catches: an MSI asks a user to hand it SYSTEM, and an
+      # unsigned one teaches them to click past the warning that says not to.
+      #
+      # Both Windows artifacts are checked. The portable zip carries the same
+      # agent binary as the MSI, and shipping a signed installer beside an
+      # unsigned executable would undo the point of signing either.
+      - name: Refuse to publish unsigned Windows artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SIGNING_REQUIRED: ${{ github.repository == 'Karib0u/rustinel' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends osslsigncode
+
+          ca=/etc/ssl/certs/ca-certificates.crt
+          status=0
+
+          # osslsigncode reads both Authenticode containers: the certificate
+          # table of a PE, and the digital signature stream of an MSI.
+          for artifact in "rustinel-${VERSION}-x86_64.msi" dist/windows-x86_64/rustinel.exe; do
+            test -f "$artifact"
+            echo "--- $artifact"
+            report="$(osslsigncode verify -CAfile "$ca" -TSA-CAfile "$ca" -in "$artifact" 2>&1 || true)"
+            echo "$report"
+
+            # Matched positively. If a future osslsigncode renames its verdict,
+            # this falls through to the error below and fails the release
+            # rather than waving an unverified artifact through.
+            if grep -qi 'Signature verification: ok' <<<"$report"; then
+              echo "$artifact carries a verified Authenticode signature."
+              continue
+            fi
+
+            if grep -qi 'No signature found' <<<"$report"; then
+              if [ "$SIGNING_REQUIRED" = true ]; then
+                echo "::error::$artifact is unsigned. The signing credentials are"
+                echo "::error::missing or expired; see docs/windows-installer.md."
+                status=1
+              else
+                echo "::warning::$artifact is unsigned. Forks have no signing credentials."
+              fi
+              continue
+            fi
+
+            # Signed, but the signature did not verify. Either the artifact was
+            # altered after signing, or the chain could not be built from the
+            # runner trust store. Neither is something to publish through.
+            echo "::error::$artifact is signed but its signature did not verify."
+            status=1
+          done
+
+          exit "$status"
+
       - name: Stage macOS packages
         run: |
           cp dist/macos-arm64/*.tar.gz .
@@ -533,6 +705,7 @@ jobs:
             rustinel-${VERSION}-x86_64-unknown-linux-musl.tar.gz \
             rustinel-${VERSION}-aarch64-unknown-linux-musl.tar.gz \
             rustinel-${VERSION}-x86_64-pc-windows-msvc.zip \
+            rustinel-${VERSION}-x86_64.msi \
             rustinel-${VERSION}-aarch64-apple-darwin.tar.gz \
             rustinel-${VERSION}-x86_64-apple-darwin.tar.gz \
             > rustinel-${VERSION}-checksums-sha256.txt
@@ -546,6 +719,7 @@ jobs:
             rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
             rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
             rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip
+            rustinel-${{ steps.version.outputs.version }}-x86_64.msi
             rustinel-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz
             rustinel-${{ steps.version.outputs.version }}-x86_64-apple-darwin.tar.gz
             rustinel-${{ steps.version.outputs.version }}-checksums-sha256.txt
@@ -557,6 +731,7 @@ jobs:
             rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz
             rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
             rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip
+            rustinel-${{ steps.version.outputs.version }}-x86_64.msi
             rustinel-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz
             rustinel-${{ steps.version.outputs.version }}-x86_64-apple-darwin.tar.gz
             rustinel-${{ steps.version.outputs.version }}-checksums-sha256.txt
@@ -572,7 +747,8 @@ jobs:
             |---|---|---|
             | Linux | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.tar.gz` |
             | Linux | arm64 | `rustinel-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl.tar.gz` |
-            | Windows | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip` |
+            | Windows | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64.msi` (signed installer) |
+            | Windows | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.zip` (portable) |
             | macOS | arm64 | `rustinel-${{ steps.version.outputs.version }}-aarch64-apple-darwin.tar.gz` |
             | macOS | x86_64 | `rustinel-${{ steps.version.outputs.version }}-x86_64-apple-darwin.tar.gz` |
 
@@ -598,6 +774,16 @@ jobs:
             ```
 
             **Windows (PowerShell)**
+
+            Permanent install, from an elevated prompt. Installs the signed MSI
+            and registers the service:
+
+            ```powershell
+            $env:RUSTINEL_VERSION='${{ steps.version.outputs.version }}'; $env:RUSTINEL_MSI='1'; irm https://rustinel.io/install.ps1 | iex; Remove-Item Env:\RUSTINEL_VERSION, Env:\RUSTINEL_MSI -ErrorAction SilentlyContinue
+            ```
+
+            Portable evaluation, which unpacks into the current directory and
+            installs nothing:
 
             ```powershell
             $env:RUSTINEL_VERSION='${{ steps.version.outputs.version }}'; irm https://rustinel.io/install.ps1 | iex; Remove-Item Env:\RUSTINEL_VERSION -ErrorAction SilentlyContinue
