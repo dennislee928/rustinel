@@ -105,7 +105,7 @@ pub(crate) fn nftables_ruleset(policy: &IsolationPolicy) -> String {
 // Built and tested on every platform, applied only where a backend exists:
 // the ruleset logic is what carries the risk, so it is not hidden behind a
 // target gate where only one CI runner would ever compile it.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn pf_ruleset(policy: &IsolationPolicy) -> String {
     let mut out = String::new();
 

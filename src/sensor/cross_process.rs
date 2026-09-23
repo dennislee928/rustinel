@@ -40,6 +40,7 @@ use std::time::SystemTime;
 ///
 /// Matched to Sysmon so a stock SigmaHQ rule selecting on `EventID: 8` rather
 /// than on logsource still fires, exactly as the Windows sensor does.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) const EVENT_ID_REMOTE_THREAD: u16 = 8;
 
 /// Sysmon's event ID for process access.
@@ -49,6 +50,10 @@ pub(crate) const EVENT_ID_PROCESS_ACCESS: u16 = 10;
 ///
 /// The spelling is what a rule matches on, so these are a detection contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Two of the three are Mach ports, which only macOS constructs. The enum stays
+// whole on every platform because the spelling is a detection contract: a rule
+// written against task_for_pid must mean the same thing wherever it is read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum AccessMethod {
     /// `ptrace`: debugger attach. The one primitive both platforms have.
     Ptrace,
@@ -134,6 +139,7 @@ pub(crate) fn process_access_event(raw: RawCrossProcess, method: AccessMethod) -
 /// `StartAddress`, `StartModule`, and `StartFunction` are left empty. A rule
 /// that matches on them will not fire here, which is the honest outcome: the
 /// alternative is inventing a value it would match against.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn remote_thread_event(raw: RawCrossProcess) -> SensorEvent {
     SensorEvent {
         platform: raw.platform,
@@ -168,6 +174,7 @@ pub(crate) fn remote_thread_event(raw: RawCrossProcess) -> SensorEvent {
 /// that asked for it. Reporting those would bury the cross-process case that
 /// matters under the one that never does, which is the same filter the Windows
 /// sensor applies to thread starts.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn is_cross_process(source_pid: u32, target_pid: u32) -> bool {
     source_pid != target_pid
 }

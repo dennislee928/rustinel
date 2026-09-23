@@ -34,14 +34,22 @@ use std::net::IpAddr;
 ///
 /// Stable by design: changing it would orphan the filters installed by an
 /// older build, leaving a host isolated with nothing able to lift it.
+///
+/// Windows-only, unlike the rest of this module's public surface: the type
+/// comes from the `windows` crate, which is a `cfg(windows)` dependency. The
+/// policy types above it are shared with the nftables and `pf` backends and
+/// must stay portable.
+#[cfg(windows)]
 pub const PROVIDER_GUID: windows::core::GUID =
     windows::core::GUID::from_u128(0x9f1d_2c3b_4a5e_6f70_8192_a3b4_c5d6_e7f8);
 
 /// Sublayer holding the filters.
+#[cfg(windows)]
 pub const SUBLAYER_GUID: windows::core::GUID =
     windows::core::GUID::from_u128(0x9f1d_2c3b_4a5e_6f70_8192_a3b4_c5d6_e7f9);
 
 /// Weight given to block filters.
+#[cfg_attr(not(windows), allow(dead_code))]
 const WEIGHT_BLOCK: u64 = 0x1000;
 
 /// Weight given to permit filters.
@@ -49,6 +57,7 @@ const WEIGHT_BLOCK: u64 = 0x1000;
 /// Above the block weight so a management exception beats the block-all inside
 /// the same sublayer. WFP resolves conflicts by weight within a sublayer, so
 /// this ordering is the whole safety mechanism for isolation.
+#[cfg_attr(not(windows), allow(dead_code))]
 const WEIGHT_PERMIT: u64 = 0x2000;
 
 /// Display name given to isolation's block filters.
@@ -57,15 +66,18 @@ const WEIGHT_PERMIT: u64 = 0x2000;
 /// part of the on-host contract rather than a label. [`ISOLATE_EXCEPTION_NAME`]
 /// deliberately extends it: one prefix match then reaches the whole isolation
 /// and nothing else in the sublayer.
+#[cfg_attr(not(windows), allow(dead_code))]
 const ISOLATE_NAME: &str = "Rustinel isolate";
 
 /// Display name given to isolation's permit filters.
+#[cfg_attr(not(windows), allow(dead_code))]
 const ISOLATE_EXCEPTION_NAME: &str = "Rustinel isolate exception";
 
 /// Display name given to per-image network blocks.
 ///
 /// Outside the [`ISOLATE_NAME`] prefix on purpose: blocking an image is a
 /// separate decision, and replacing an isolation must not lift it.
+#[cfg_attr(not(windows), allow(dead_code))]
 const BLOCK_IMAGE_NAME: &str = "Rustinel block image";
 
 /// What must keep working while a host is isolated.
@@ -1147,6 +1159,9 @@ mod tests {
             .supports(ActionKind::TerminateProcess));
     }
 
+    // The identities are WFP's, and so is their type: this test compiles only
+    // where the `windows` crate does.
+    #[cfg(windows)]
     #[test]
     fn the_provider_and_sublayer_identities_are_distinct_and_fixed() {
         // These are how isolation is found again after a reboot. Changing

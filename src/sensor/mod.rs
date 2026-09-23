@@ -30,15 +30,18 @@ pub mod macos;
 #[cfg(any(windows, test))]
 mod network_events;
 // Same reason as `persistence` below: plain data assembly, so it is built and
-// tested on every platform rather than only on a macOS runner.
-#[cfg(any(target_os = "macos", test))]
+// tested on every platform rather than only on a macOS runner. Linux is in the
+// list because the eBPF sensor calls it too -- src/sensor/linux/ebpf.rs turns a
+// ptrace attach into a ProcessAccess event through this module.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) mod cross_process;
 /// Post-sensor enrichment, on every platform that has a sensor.
 pub(crate) mod enrichment;
 // Compiled for tests everywhere, like `integrity_level`: the logic is pure
 // path handling, and a classifier only exercised on a macOS runner is one
-// whose evasion cases nobody runs.
-#[cfg(any(target_os = "macos", test))]
+// whose evasion cases nobody runs. Linux needs it at runtime as well --
+// src/sensor/linux/events.rs classifies every file write through it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) mod persistence;
 #[cfg(windows)]
 pub mod windows;

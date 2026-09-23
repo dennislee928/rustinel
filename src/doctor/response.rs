@@ -11,7 +11,11 @@
 
 use super::inspect::DiagnosticResult;
 use crate::config::ResponseConfig;
-use crate::response::executor::{driver, wfp};
+use crate::response::executor::wfp;
+// The kernel driver is a Windows component; on every other platform there is
+// nothing to ask about, and the module that would answer is not compiled.
+#[cfg(windows)]
+use crate::response::executor::driver;
 use std::path::Path;
 
 /// Report on whether the configured response actions can run.
@@ -20,6 +24,7 @@ pub fn response_results(response: &ResponseConfig) -> Vec<DiagnosticResult> {
 
     results.extend(isolation_results(response));
     results.extend(quarantine_results(response));
+    #[cfg(windows)]
     results.extend(driver_results());
 
     // Anything currently contained is worth saying out loud, whether or not
@@ -63,6 +68,7 @@ pub fn response_results(response: &ResponseConfig) -> Vec<DiagnosticResult> {
 /// registry writes and file operations while leaving handle opens against
 /// `lsass` untouched. That looks identical to a working driver from the
 /// outside, which is exactly the kind of thing this report exists to catch.
+#[cfg(windows)]
 fn driver_results() -> Vec<DiagnosticResult> {
     let executor = driver::KernelDriverExecutor::new();
     if !executor.driver_present() {
